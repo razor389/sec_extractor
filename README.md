@@ -28,6 +28,7 @@ This addresses the challenge of inconsistent formatting and XBRL tagging across 
 
 ## Project Structure
 
+```text
 src/
 ├── main.rs            # Entry point and CLI handling
 ├── edgar/             # SEC EDGAR API interaction
@@ -59,6 +60,7 @@ src/
     └── error.rs       # Custom error handling (thiserror)
 Cargo.toml
 README.md
+```
 
 ## Getting Started (Development)
 
