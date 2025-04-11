@@ -1,1073 +1,776 @@
 // src/extractors/section.rs
 use crate::utils::error::ExtractError;
+use once_cell::sync::Lazy;
 use regex::Regex;
-use std::collections::HashMap;
-use std::env;
 
-/// Returns the configured minimum section size.
-/// Reads from MIN_SECTION_SIZE environment variable, defaulting to 50 
-/// for tests if not set.
-fn get_min_section_size() -> usize {
-    match env::var("MIN_SECTION_SIZE") {
-        Ok(val) => val.parse().unwrap_or(50),
-        Err(_) => 50, // Default value for tests
-    }
-}
+// --- Constants ---
+const TOC_CHECK_RANGE: usize = 10000;
+const START_VALIDATION_LOOKAHEAD: usize = 5000;
+const END_SEARCH_BUFFER: usize = 100;
+const FALLBACK_END_CHUNK_SIZE: usize = 350_000;
+const TOC_POSITIONAL_CHECK_PERCENT: usize = 5; // Check if match is within first 5% of document
 
-/// Checks if a position is within a table of contents section
-fn is_in_table_of_contents(html_content: &str, position: usize) -> bool {
-    // Common ToC indicators
-    let toc_indicators = [
+// --- Lazy-Initialized Regex Patterns ---
+
+// ToC Detection Patterns
+static TOC_INDICATORS_RE: Lazy<Vec<Regex>> = Lazy::new(|| {
+    [
         r"(?i)<h[1-6][^>]*>\s*(?:table\s+of\s+contents|index|contents)\s*</h[1-6]>",
-        // Changed to use hash-delimited raw string literal
-        r#"(?i)<div[^>]*class=['"]?(?:toc|tableOfContents|index)['"]?[^>]*>"#,
-        r"(?i)table\s+of\s+contents",
-    ];
-    
-    // Look for ToC indicators before the position
-    // Check within a reasonable range (e.g., 5000 characters) before the position
-    let start_search = if position > 5000 { position - 5000 } else { 0 };
-    let content_before = &html_content[start_search..position];
-    
-    for pattern in &toc_indicators {
-        if let Ok(re) = Regex::new(pattern) {
-            if re.is_match(content_before) {
-                // Now check if we're still in the ToC section
-                // Look for common end-of-ToC markers
-                let end_toc_markers = [
-                    r"(?i)</div>\s*<h[1-6]", // End of div followed by a heading
-                    r"(?i)</nav>",           // End of navigation section
-                    r"(?i)<hr",              // Horizontal rule often separates ToC
-                    r"(?i)<h[1-6][^>]*>\s*PART\s+I\s*</h[1-6]>", // Start of Part I
-                ];
-                
-                for end_pattern in &end_toc_markers {
-                    if let Ok(end_re) = Regex::new(end_pattern) {
-                        if let Some(end_match) = end_re.find(content_before) {
-                            // If we found an end-of-ToC marker before our position,
-                            // then we're not in the ToC
-                            if start_search + end_match.end() < position {
-                                return false;
-                            }
+        r#"(?i)<div[^>]*class=['"]?(?:toc|tableofcontents|index)['"]?[^>]*>"#, // Common class names
+        r#"(?i)<nav[^>]*class=['"]?(?:toc|tableofcontents)['"]?[^>]*>"#, // Common nav classes
+        r"(?i)\btable\s+of\s+contents\b", // Plain text
+        r"(?i)item\s+\d+\.?\s*[\s\.]{3,}\s*(?:page|pg\.?)\s*\d+", // Item...Page pattern with dot leaders
+    ]
+    .iter()
+    .filter_map(|pat| Regex::new(pat).ok())
+    .collect()
+});
+
+static END_TOC_MARKERS_RE: Lazy<Vec<Regex>> = Lazy::new(|| {
+    [
+        r"(?i)</div>\s*<(?:p|h[1-6]|table|ul|ol)", // End of a div followed by common block elements
+        r"(?i)</nav>",
+        r"(?i)<hr", // Includes page breaks often done with <hr>
+        r"(?i)<h[1-6][^>]*>\s*PART\s+I\b",
+        r"(?i)<h[1-6][^>]*>\s*Item\s+1\b",
+        r###"(?i)<hr[^>]*class=['"'][^'"]*page-break[^'"]*['"']"###, // Explicit page break class
+        r###"(?i)style=['"'][^'"]*page-break-before[^'"]*['"']"###, // Explicit page break style
+        // Added: Look for start of main content sections
+        r"(?i)<h[1-6][^>]*>\s*(?:Item\s+1\b|Business\b|Risk\s*Factors\b)",
+    ]
+    .iter()
+    .filter_map(|pat| Regex::new(pat).ok())
+    .collect()
+});
+
+// Item 8 Start Patterns - More specific first
+static ITEM_8_START_RE: Lazy<Vec<Regex>> = Lazy::new(|| {
+    [
+        // Full title in specific tags
+        r#"(?is)<h[1-6][^>]*>\s*Item\s*8\.?\s*Financial\s*Statements\s*(?:and\s*Supplementary\s*Data)?\s*</h[1-6]>"#,
+        r#"(?is)<p[^>]*>\s*<b>\s*Item\s*8\.?\s*Financial\s*Statements\s*(?:and\s*Supplementary\s*Data)?\s*</b>\s*</p>"#, // Bold paragraph common pattern
+        r#"(?is)(?:<p[^>]*>|<div[^>]*>)\s*(?:<b>|<strong>)\s*Item\s*8\.?\s*Financial\s*Statements\s*(?:and\s*Supplementary\s*Data)?\s*(?:</b>|</strong>)\s*(?:</p>|</div>)"#, // Other bold variations
+
+        // "Item 8." inside specific tags
+        r#"(?is)<h[1-6][^>]*>.*?\bItem\s*8\..*?</h[1-6]>"#,
+        r#"(?is)(?:<p[^>]*>|<div[^>]*>|<span>|<font[^>]*>|<b>|<strong>)\s*\bItem\s*8\.\s*(?:</p>|</div>|</span>|</font>|</b>|</strong>|<)"#,
+
+        // Text patterns (lower priority)
+        r"(?i)\bItem\s*8[\.\s\-–—:]+Financial\s*Statements\s*(?:and\s*Supplementary\s*Data)?\b",
+        r"(?i)\bItem\s*8\.", // Simplest text match
+    ]
+    .iter()
+    .filter_map(|pat| Regex::new(pat).ok())
+    .collect()
+});
+
+// Item 8 End Patterns - Keep as is (seemed okay)
+static ITEM_8_END_RE: Lazy<Vec<Regex>> = Lazy::new(|| {
+     [
+        r#"(?is)<h[1-6][^>]*>\s*Item\s*9[ABC]?\.?\s*[Cc]hanges\b"#, // Item 9, 9A, 9B etc.
+        r#"(?is)(?:<p[^>]*>|<div[^>]*>|<strong>)\s*Item\s*9[ABC]?\.?\s*[Cc]hanges\b"#,
+        r"(?i)\bItem\s*9[ABC]?\.?\s*[–\-—\s:]*\s*[Cc]hanges\s*in\s*and\s*[Dd]isagreements",
+        r"(?i)\bItem\s*9\.", // Simple Item 9. marker
+        r#"(?is)<h[1-6][^>]*>\s*PART\s*III\b"#, // Start of Part III
+        r#"(?is)(?:<p[^>]*>|<div[^>]*>|<strong>)\s*PART\s*III\b"#,
+        r"(?i)\bPART\s+III\b", // Plain text PART III
+        r#"(?is)<h[1-6][^>]*>\s*Item\s*10\.?\s*[Dd]irectors\b"#, // Start of Item 10
+        r#"(?is)(?:<p[^>]*>|<div[^>]*>|<strong>)\s*Item\s*10\.?\s*[Dd]irectors\b"#,
+        r"(?i)\bSIGNATURES\b", // Signatures section
+        r"(?i)\bEXHIBIT\s+INDEX\b", // Exhibit Index section
+        r"(?i)<h[1-6][^>]*>\s*EXHIBITS?\b", // Exhibits header
+    ]
+    .iter()
+    .filter_map(|pat| Regex::new(pat).ok())
+    .collect()
+});
+
+// *** NEW REGEXES FOR IMPROVED TOC CHECK ***
+static TOC_CONTAINER_START_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r#"(?i)<(?:div|nav|ul|ol)[^>]*?(?:id|class)\s*=\s*['"]?(?:toc|tableofcontents|table-of-contents|index)['"]?"#)
+        .expect("Failed to compile TOC_CONTAINER_START_RE")
+});
+static TOC_QUICK_END_RE: Lazy<Regex> = Lazy::new(|| {
+    Regex::new(r"(?i)</(?:div|nav|ul|ol)>|<hr\b|<h[1-6][^>]*>\s*PART\s+I\b|<h[1-6][^>]*>\s*Item\s+1\b")
+        .expect("Failed to compile TOC_QUICK_END_RE")
+});
+// *** END NEW REGEXES ***
+
+
+// --- Helper Functions ---
+
+/// Checks if a position is likely within a table of contents section.
+fn is_in_table_of_contents(html_content: &str, position: usize) -> bool {
+    // 1. Positional Check (Check if very early in the document)
+    let positional_threshold = (html_content.len() * TOC_POSITIONAL_CHECK_PERCENT) / 100;
+    let min_absolute_pos_check = 500; // Don't consider anything before this absolute position as non-ToC easily
+    if position < positional_threshold || position < min_absolute_pos_check {
+         tracing::trace!("Potential ToC match at pos {} (within first {}% or first {} bytes)", position, TOC_POSITIONAL_CHECK_PERCENT, min_absolute_pos_check);
+         // Simple extra check: is it inside an obvious ToC container near the start?
+         let nearby_start = position.saturating_sub(500);
+         // Check content *around* the position for quick context
+         let nearby_end = (position + 100).min(html_content.len());
+         if nearby_start < nearby_end { // Check range validity
+             let surrounding = &html_content[nearby_start..nearby_end];
+             // Check against the specific container regex
+             if TOC_CONTAINER_START_RE.is_match(surrounding) {
+                 tracing::debug!("Skipping potential ToC match at pos {} (early & near specific toc container pattern)", position);
+                 return true;
+             }
+             // Keep original simple class check as fallback
+             if surrounding.contains(r#"class="toc"#) || surrounding.contains(r#"class="tableofcontents"#) {
+                 tracing::debug!("Skipping potential ToC match at pos {} (early & near simple toc class)", position);
+                 return true;
+            }
+         }
+         // If it's very early but no container found nearby, it's likely still ToC or intro material.
+         // Returning true here is safer to avoid false positives early on.
+         tracing::debug!("Skipping potential ToC match at pos {} (very early position)", position);
+         return true;
+    }
+
+
+    // 2. ADDED CHECK: Look for containing ToC element
+    let container_search_start = position.saturating_sub(2000); // Look back a reasonable distance
+    if container_search_start < position { // Ensure range is valid
+        let context_before = &html_content[container_search_start..position];
+
+        // Find the *last* ToC container start tag *before* the position
+        if let Some(container_match) = TOC_CONTAINER_START_RE.find_iter(context_before).last() {
+            let container_start_pos = container_search_start + container_match.start();
+            tracing::trace!("Found potential ToC container start near {} before position {}", container_start_pos, position);
+
+            // Now check if an end marker exists *between* the container start and the current position
+            // Ensure slice is valid
+            if container_start_pos < position {
+                let content_inside = &html_content[container_start_pos..position];
+                if TOC_QUICK_END_RE.find(content_inside).is_none() {
+                    // No closing tag or major break found between container start and position. Likely still inside.
+                    tracing::debug!("Skipping potential ToC match at pos {} (appears inside ToC container starting near {} with no intermediate end marker)", position, container_start_pos);
+                    return true; // It's inside the container
+                } else {
+                    tracing::trace!("Found an end marker between container start {} and position {}", container_start_pos, position);
+                    // Continue to the next check, as we might be outside the specific container
+                }
+            }
+        }
+    }
+    // END ADDED CHECK
+
+
+    // 3. Original Structural Check (As fallback/further validation)
+    let search_start = position.saturating_sub(TOC_CHECK_RANGE);
+    // Ensure slice end is strictly less than slice start
+    if search_start >= position {
+        tracing::warn!("Invalid range for ToC indicator search (start={}, end={})", search_start, position);
+        return false; // Cannot search, assume not in ToC
+    }
+    let content_before = &html_content[search_start..position];
+
+
+    let mut toc_indicator_found_pos: Option<usize> = None;
+     // Find the start position of the *latest* indicator found *before* the current position
+     for re in TOC_INDICATORS_RE.iter() {
+         if let Some(toc_match) = re.find_iter(content_before).last() {
+             // Use the *absolute* start position of the indicator match
+             let current_indicator_start_abs = search_start + toc_match.start();
+             if toc_indicator_found_pos.map_or(true, |latest| current_indicator_start_abs > latest) {
+                 toc_indicator_found_pos = Some(current_indicator_start_abs);
+             }
+         }
+     }
+
+
+    if let Some(absolute_toc_indicator_start) = toc_indicator_found_pos {
+        tracing::trace!("Latest ToC indicator relative to main pos {} starts around abs pos {}", position, absolute_toc_indicator_start);
+
+        let search_for_end_marker_start = absolute_toc_indicator_start; // Search from the indicator start
+
+        // Ensure slice is valid and search range is reasonable
+        if search_for_end_marker_start < position {
+            // Define the area to search for an end marker: from the indicator start up to slightly beyond the current position
+             let search_limit_end = (position + END_SEARCH_BUFFER).min(html_content.len()); // Look slightly beyond position for end marker
+            if search_for_end_marker_start < search_limit_end { // Final check for valid range
+                let content_between_indicator_and_pos_area = &html_content[search_for_end_marker_start..search_limit_end];
+
+                let mut end_marker_found_before_pos = false;
+                for end_re in END_TOC_MARKERS_RE.iter() {
+                    if let Some(end_match) = end_re.find(content_between_indicator_and_pos_area) {
+                        let absolute_end_marker_pos = search_for_end_marker_start + end_match.start();
+                        // Check if this end marker occurs *before* our target position
+                        if absolute_end_marker_pos < position {
+                             tracing::trace!("Found ToC end marker '{}' at {} between indicator {} and position {}", end_re.as_str(), absolute_end_marker_pos, absolute_toc_indicator_start, position);
+                            end_marker_found_before_pos = true;
+                            break; // Found an end marker before the position, definitely not in ToC anymore
                         }
+                        // If end marker is found *at or after* the position, it doesn't help us exclude the current position yet.
                     }
                 }
-                
-                // If we found a ToC indicator but no end marker, we're likely in a ToC
-                return true;
-            }
-        }
-    }
-    
-    false
-}
 
-#[allow(dead_code)]
-// Helper function to find the end of a section starting from a position
-fn find_section_end(html_content: &str, start_pos: usize) -> Option<(usize, usize)> {
-    // Look for Item 9 or PART III to determine the end
-    let end_patterns = [
-        r"(?i)<h[1-6][^>]*>\s*Item\s*9\.?\s*Changes\s*in\s*and\s*Disagreements\s*with\s*Accountants\s*</h[1-6]>",
-        r"(?i)Item\s*9\.?\s*Changes\s*in\s*and\s*Disagreements\s*with\s*Accountants",
-        r"(?i)<a[^>]*>\s*Item\s*9\.\s*</a>\s*Changes\s*in\s*and\s*Disagreements\s*with\s*Accountants",
-        r"(?i)Item\s*9[\.\s\-–—:]+\s*Changes\s*in\s*and\s*Disagreements\s*with\s*Accountants",
-        r"(?i)item\s*9[\.\s]*",
-        r"(?i)item\s*9[\.\s]*\(?changes",
-        r"(?i)<h[1-6][^>]*>\s*PART\s*III\s*</h[1-6]>"
-    ];
-    
-    let search_from = start_pos + 100; // Skip a bit to avoid early matches
-    
-    let mut end_pos = None;
-    for pattern in &end_patterns {
-        if let Ok(re) = Regex::new(pattern) {
-            if let Some(mat) = re.find(&html_content[search_from..]) {
-                end_pos = Some(search_from + mat.start());
-                break;
+                if !end_marker_found_before_pos {
+                    // Found ToC indicator, but no clear end marker after it *before* our position
+                    tracing::debug!("Fallback ToC Check: Potential ToC match at pos {} (found ToC indicator near {}, no clear end marker found *before* pos)", position, absolute_toc_indicator_start);
+                    return true; // Assume it's still in ToC
+                } else {
+                    // Found end marker before position -> Not in ToC anymore
+                    tracing::trace!("Position {} is after an end marker found before it (indicator started at {})", position, absolute_toc_indicator_start);
+                    return false;
+                }
+
+            } else {
+                 tracing::warn!("Structural ToC Check: Invalid range for end marker search ({}-{})", search_for_end_marker_start, search_limit_end);
+                 return false; // Cannot search effectively
             }
-        }
-    }
-    
-    // If no end marker found, use a reasonable chunk size
-    let end_pos = end_pos.unwrap_or_else(|| (start_pos + 300000).min(html_content.len()));
-    
-    // Validate that we have a reasonable section size
-    let min_section_size = get_min_section_size();
-    if end_pos > start_pos && end_pos - start_pos > min_section_size {
-        // Validate that we have actual financial content, not just a section heading
-        let content = &html_content[start_pos..end_pos];
-        let content_lower = content.to_lowercase();
-        
-        let has_financial_terms = 
-            content_lower.contains("consolidated balance sheet") ||
-            content_lower.contains("statement of operations") ||
-            content_lower.contains("statement of income") ||
-            content_lower.contains("statement of cash flow") ||
-            content_lower.contains("notes to consolidated") ||
-            (content_lower.contains("report") && 
-             content_lower.contains("independent") && 
-             content_lower.contains("audit"));
-            
-        let has_financial_tables = 
-            content.contains("<table") && 
-            (content_lower.contains("assets") || 
-             content_lower.contains("liabilities") ||
-             content_lower.contains("equity") ||
-             content_lower.contains("revenue") ||
-             content_lower.contains("expense"));
-        
-        if has_financial_terms || has_financial_tables {
-            Some((start_pos, end_pos))
         } else {
-            None
+             tracing::warn!("Structural ToC Check: Invalid range - end marker search start ({}) not before position ({})", search_for_end_marker_start, position);
+             // This might happen if the indicator is *immediately* before the position. Treat as ToC.
+             return true; // Safer to assume it's ToC if indicator is right before it.
         }
     } else {
-        None
+        tracing::trace!("No relevant ToC indicator found before position {}", position);
     }
+
+    false // Default: assume not in ToC if no checks returned true
 }
 
-/// Represents an extracted section from a 10-K filing
+
+/// Validates if the text slice looks like it contains financial data. (Keep as is)
+fn contains_financial_content(text_slice: &str) -> bool {
+     if text_slice.is_empty() { return false; }
+    let lower_content = text_slice.to_lowercase();
+    // Check for common financial statement titles
+    let has_statement_titles = lower_content.contains("consolidated balance sheet")
+        || lower_content.contains("consolidated statement of operations")
+        || lower_content.contains("consolidated statement of income")
+        || lower_content.contains("consolidated statement of cash flow")
+        || lower_content.contains("consolidated statements of cash flows") // Plural variation
+        || lower_content.contains("consolidated statement of stockholders' equity")
+        || lower_content.contains("consolidated statement of shareholders' equity")
+        || lower_content.contains("consolidated statements of comprehensive income")
+        || lower_content.contains("consolidated statements of comprehensive loss");
+
+    // Check for typical audit report phrasing
+    let has_audit_report = lower_content.contains("report of independent registered public accounting firm")
+        || (lower_content.contains("opinion") && lower_content.contains("audit") && lower_content.contains("financial statement"));
+
+    // Check for notes section title
+    let has_notes = lower_content.contains("notes to consolidated financial statements")
+                 || lower_content.contains("notes to financial statements"); // Simpler variation
+
+    // Check for presence of tables containing typical financial keywords (requires minimal length)
+    let has_tables_with_keywords = if text_slice.contains("<table") {
+        lower_content.contains("assets")
+        || lower_content.contains("liabilities")
+        || lower_content.contains("equity")
+        || lower_content.contains("revenue")
+        || lower_content.contains("expense")
+        || lower_content.contains("net income")
+        || lower_content.contains("net loss")
+        || lower_content.contains("cash flow")
+    } else { false };
+
+    // Combine checks: Must have at least one strong indicator OR tables with keywords and sufficient length
+    let is_valid = has_statement_titles || has_audit_report || has_notes || (has_tables_with_keywords && text_slice.len() > 2000);
+
+     tracing::trace!(
+         "Financial content validation: has_statements={}, has_audit={}, has_notes={}, has_tables_keywords={}, len={}, result={}",
+         has_statement_titles, has_audit_report, has_notes, has_tables_with_keywords, text_slice.len(), is_valid
+     );
+     is_valid
+}
+
+// --- Extraction Logic ---
 #[derive(Debug, Clone)]
 pub struct ExtractedSection {
-    pub section_name: String,     // e.g., "Item 8"
-    pub section_title: String,    // e.g., "Financial Statements and Supplementary Data"
-    pub content: String,          // The raw HTML/text content
-    pub filing_year: u32,         // The year of the filing
-    pub company_name: String,     // Company name
-    pub ticker: String,           // Ticker symbol
+    pub section_name: String,   // e.g., "Item 8"
+    pub section_title: String,  // e.g., "Financial Statements and Supplementary Data"
+    pub content: String,        // The raw HTML content
+    pub filing_year: u32,       // The year of the filing
+    pub company_name: String,   // Company name
+    pub ticker: String,         // Ticker symbol
 }
 
-/// Extraction Strategy trait for implementing different section extraction methods
-pub trait ExtractionStrategy {
-    fn name(&self) -> &'static str;
-    fn extract(&self, html_content: &str) -> Option<(usize, usize)>;
-}
+/// Attempts to find the start and end byte positions of Item 8.
+fn find_item_8_bounds(html_content: &str) -> Option<(usize, usize)> {
+    let mut first_valid_start: Option<(usize, &str)> = None; // Store (position, pattern_str)
 
-/// Pattern-based extraction strategy using regular expressions
-pub struct PatternExtractionStrategy {
-    pub name: &'static str,
-    pub start_patterns: Vec<&'static str>,
-    pub end_patterns: Vec<&'static str>,
-}
+    // --- Find the best START position ---
+    'outer_start: for start_re in ITEM_8_START_RE.iter() {
+        for mat in start_re.find_iter(html_content) {
+            let potential_start_pos = mat.start();
+            let match_end_pos = mat.end(); // Where the start pattern match ends
 
-impl ExtractionStrategy for PatternExtractionStrategy {
-    fn name(&self) -> &'static str {
-        self.name
-    }
-    
-    fn extract(&self, html_content: &str) -> Option<(usize, usize)> {
-        // Find start position
-        let mut start_pos = None;
-        for pattern in &self.start_patterns {
-            if let Ok(re) = Regex::new(pattern) {
-                // Find all occurrences
-                for mat in re.find_iter(html_content) {
-                    // Skip matches in table of contents
-                    if is_in_table_of_contents(html_content, mat.start()) {
-                        tracing::debug!("Skipping ToC match for pattern '{}' at position: {}", 
-                            pattern, mat.start());
-                        continue;
-                    }
-                    
-                    // Verify this looks like the actual Item 8 section, not just a reference
-                    // Check that there's substantial content following it
-                    let content_check_end = (mat.end() + 2000).min(html_content.len());
-                    let following_content = &html_content[mat.end()..content_check_end];
-                    
-                    // Look for indicators of actual financial content
-                    let has_financial_terms = 
-                        following_content.to_lowercase().contains("consolidated") ||
-                        following_content.to_lowercase().contains("balance sheet") ||
-                        following_content.to_lowercase().contains("income statement") ||
-                        following_content.to_lowercase().contains("cash flow") ||
-                        following_content.to_lowercase().contains("financial statement") ||
-                        following_content.to_lowercase().contains("audit") ||
-                        following_content.to_lowercase().contains("notes to");
-                    
-                    if has_financial_terms {
-                        start_pos = Some(mat.start());
-                        tracing::debug!("Found valid start pattern match: '{}' at position: {}", 
-                            pattern, mat.start());
-                        break;
-                    } else {
-                        tracing::debug!("Skipping match without financial content at position: {}", 
-                            mat.start());
-                    }
-                }
-                
-                if start_pos.is_some() {
-                    break;
-                }
-            }
-        }
-        
-        let start_pos = start_pos?;
-        
-        // Find end position
-        let mut end_pos = None;
-        for pattern in &self.end_patterns {
-            if let Ok(re) = Regex::new(pattern) {
-                // Search from start_pos to the end of the document
-                if let Some(mat) = re.find(&html_content[start_pos + 100..]) {
-                    end_pos = Some(start_pos + 100 + mat.start());
-                    tracing::debug!("Found end pattern match: '{}' at position: {}", pattern, end_pos.unwrap());
-                    break;
-                }
-            }
-        }
-        
-        // If no end marker found, try looking for the next Item heading
-        if end_pos.is_none() {
-            // Look for any Item X heading after Item 8
-            let next_item_re = Regex::new(r"(?i)<h[1-6][^>]*>\s*Item\s*[0-9]+\.?").ok();
-            if let Some(re) = next_item_re {
-                if let Some(mat) = re.find(&html_content[start_pos + 1000..]) { // Skip a bit to avoid re-matching Item 8
-                    end_pos = Some(start_pos + 1000 + mat.start());
-                    tracing::debug!("Found next Item heading at position: {}", end_pos.unwrap());
-                }
-            }
-        }
-        
-        // If still no end marker found, use a larger chunk size or go to the end
-        let end_pos = end_pos.unwrap_or_else(|| (start_pos + 300000).min(html_content.len()));
-        
-        // Only return if the section is reasonably sized
-        if end_pos > start_pos && end_pos - start_pos > get_min_section_size() {
-            Some((start_pos, end_pos))
-        } else {
-            None
-        }
-    }
-}
+            tracing::trace!("Considering potential start at {} (match ends {}) with pattern: '{}'", potential_start_pos, match_end_pos, start_re.as_str());
 
-/// Table of Contents (ToC) based extraction strategy
-pub struct TocExtractionStrategy;
-
-impl ExtractionStrategy for TocExtractionStrategy {
-    fn name(&self) -> &'static str {
-        "ToC Strategy"
-    }
-    
-    fn extract(&self, html_content: &str) -> Option<(usize, usize)> {
-        // Look for ToC links to Item 8
-        let toc_re = Regex::new(r#"(?i)<a[^>]*href="[^"]*(?:item[_\-]?8|financial[_\-]statements)[^"]*"[^>]*>.*?item\s*8.*?</a>"#).ok()?;
-        
-        if let Some(mat) = toc_re.find(html_content) {
-            // Extract the href attribute
-            let href_re = Regex::new(r#"href="([^"]*)""#).ok()?;
-            if let Some(href_mat) = href_re.captures(&html_content[mat.start()..mat.end()]) {
-                if let Some(href) = href_mat.get(1) {
-                    let href_val = href.as_str();
-                    tracing::debug!("Found ToC link: {}", href_val);
-                    
-                    // Find the target anchor in the document
-                    let anchor_pattern = if href_val.starts_with("#") {
-                        format!(r#"(?i)<[^>]*(?:id|name)="{}"[^>]*>"#, &href_val[1..])
-                    } else {
-                        format!(r#"(?i)<[^>]*(?:id|name)="[^"]*{}"[^>]*>"#, href_val)
-                    };
-                    
-                    let anchor_re = Regex::new(&anchor_pattern).ok()?;
-                    if let Some(anchor_mat) = anchor_re.find(html_content) {
-                        let start_pos = anchor_mat.start();
-                        
-                        // Look for Item 9 or PART III to determine the end
-                        let end_patterns = [
-                            r"(?i)<h[1-6][^>]*>\s*Item\s*9\.?\s*",
-                            r"(?i)Item\s*9[\.\s]*\(?changes",
-                            r"(?i)<h[1-6][^>]*>\s*PART\s*III\s*</h[1-6]>"
-                        ];
-                        
-                        let mut end_pos = None;
-                        for pattern in &end_patterns {
-                            if let Ok(re) = Regex::new(pattern) {
-                                if let Some(mat) = re.find(&html_content[start_pos..]) {
-                                    end_pos = Some(start_pos + mat.start());
-                                    break;
-                                }
-                            }
-                        }
-                        
-                        // If no end marker found, use a reasonable chunk size
-                        let end_pos = end_pos.unwrap_or_else(|| (start_pos + 200000).min(html_content.len()));
-                        
-                        return Some((start_pos, end_pos));
-                    }
-                }
+            // ** Check if likely in Table of Contents **
+            if is_in_table_of_contents(html_content, potential_start_pos) {
+                tracing::debug!("Skipping potential start at {} - Failed ToC check (pattern: '{}').", potential_start_pos, start_re.as_str());
+                continue; // Skip this match, try next match or pattern
             }
-        }
-        
-        None
-    }
-}
 
-/// Specialized strategy to find the actual Item 8 content, not ToC references
-pub struct ActualItem8ExtractionStrategy;
+            // ** Look ahead for financial content validation **
+            // Ensure lookahead range is valid
+            let lookahead_start = match_end_pos; // Start validation right after the matched pattern
+            let lookahead_end = (lookahead_start + START_VALIDATION_LOOKAHEAD).min(html_content.len());
 
-impl ExtractionStrategy for ActualItem8ExtractionStrategy {
-    fn name(&self) -> &'static str {
-        "Actual Item 8 Content Strategy"
-    }
-    
-    fn extract(&self, html_content: &str) -> Option<(usize, usize)> {
-        // First find PART II which typically contains Item 8
-        let part2_re = Regex::new(r"(?i)<h[1-6][^>]*>\s*PART\s*II\s*</h[1-6]>").ok()?;
-        let part2_matches: Vec<_> = part2_re.find_iter(html_content).collect();
-        
-        // If we can't find PART II, try the whole document
-        let search_from = if !part2_matches.is_empty() {
-            part2_matches[0].start()
-        } else {
-            0
-        };
-        
-        // Search for Item 8 heading after PART II and record header end.
-        let item8_patterns = [
-            r"(?i)<h[1-6][^>]*>\s*Item\s*8\.?\s*Financial\s*Statements\s*and\s*Supplementary\s*Data\s*</h[1-6]>",
-            r"(?i)<div[^>]*>\s*(?:<strong>)?\s*Item\s*8\.?\s*Financial\s*Statements\s*and\s*Supplementary\s*Data\s*(?:</strong>)?\s*</div>",
-            r"(?i)<p[^>]*>\s*(?:<strong>)?\s*Item\s*8\.?\s*Financial\s*Statements\s*and\s*Supplementary\s*Data\s*(?:</strong>)?\s*</p>",
-            r"(?i)<span[^>]*>\s*Item\s*8\.?\s*Financial\s*Statements\s*and\s*Supplementary\s*Data\s*</span>",
-            r"(?i)<font[^>]*>\s*Item\s*8\.?\s*Financial\s*Statements\s*and\s*Supplementary\s*Data\s*</font>",
-            r"(?i)Item\s*8[\.\s\-–—:]+\s*Financial\s*Statements\s*and\s*Supplementary\s*Data"
-        ];
-        
-        let mut start_pos = None;
-        let mut header_end = None; // We'll record where the header ends.
-        
-        for pattern in &item8_patterns {
-            if let Ok(re) = Regex::new(pattern) {
-                // Search from our determined offset
-                for mat in re.find_iter(&html_content[search_from..]) {
-                    let actual_pos = search_from + mat.start();
-                    
-                    // Skip if this is in a table of contents.
-                    if is_in_table_of_contents(html_content, actual_pos) {
-                        tracing::debug!("Skipping ToC match at position: {}", actual_pos);
-                        continue;
-                    }
-                    
-                    // Use the end of the matched header as our new search offset.
-                    let candidate_header_end = search_from + mat.end();
-                    let look_ahead = 5000;
-                    let end_preview = (candidate_header_end + look_ahead).min(html_content.len());
-                    let preview = &html_content[candidate_header_end..end_preview];
-                    
-                    // Verify there are financial content indicators.
-                    if preview.to_lowercase().contains("consolidated")
-                        || preview.to_lowercase().contains("balance sheet")
-                        || preview.to_lowercase().contains("statement of")
-                        || preview.to_lowercase().contains("cash flow")
-                        || preview.to_lowercase().contains("report of independent")
-                        || (preview.to_lowercase().contains("opinion") && preview.to_lowercase().contains("audit"))
-                    {
-                        start_pos = Some(actual_pos);
-                        header_end = Some(candidate_header_end);
-                        tracing::info!("Found actual Item 8 content at position {}", actual_pos);
-                        break;
-                    }
-                }
-                if start_pos.is_some() {
-                    break;
-                }
+            if lookahead_start >= lookahead_end {
+                tracing::trace!("Skipping potential Item 8 start at {} - lookahead range invalid (start={}, end={})", potential_start_pos, lookahead_start, lookahead_end);
+                continue; // Skip, range is empty or invalid
             }
-        }
-        
-        // If still not found, try broader patterns...
-        if start_pos.is_none() {
-            let broader_patterns = [
-                r"(?i)item\s*8[\.\s]*",
-                r"(?i)financial\s+statements\s+and\s+supplementary\s+data"
-            ];
-            
-            for pattern in &broader_patterns {
-                if let Ok(re) = Regex::new(pattern) {
-                    for mat in re.find_iter(&html_content[search_from..]) {
-                        let actual_pos = search_from + mat.start();
-                        
-                        if is_in_table_of_contents(html_content, actual_pos) {
-                            continue;
-                        }
-                        
-                        let candidate_header_end = search_from + mat.end();
-                        let look_ahead = 10000; // Look further with broader patterns
-                        let end_preview = (candidate_header_end + look_ahead).min(html_content.len());
-                        let preview = &html_content[candidate_header_end..end_preview];
-                        
-                        if (preview.to_lowercase().contains("consolidated balance sheet") ||
-                            preview.to_lowercase().contains("statement of operations") ||
-                            preview.to_lowercase().contains("statement of income") ||
-                            preview.to_lowercase().contains("statement of cash flow"))
-                           && (preview.contains("<table") || preview.to_lowercase().contains("notes to"))
-                        {
-                            start_pos = Some(actual_pos);
-                            header_end = Some(candidate_header_end);
-                            tracing::info!("Found actual Item 8 with broader pattern at position {}", actual_pos);
-                            break;
-                        }
-                    }
-                    if start_pos.is_some() {
-                        break;
-                    }
-                }
-            }
-        }
-        
-        // If we found a valid start position, now search for an end marker.
-        if let Some(start) = start_pos {
-            // Use the end of the header as the starting point; if not available, use start + a small offset.
-            let search_offset = header_end.unwrap_or((start + 100).min(html_content.len()));
-            
-            // Modified end patterns: match any header that begins with "Item 9. Changes"
-            let end_patterns = [
-                r"(?i)<h[1-6][^>]*>\s*Item\s*9\.?\s*Changes\b",
-                r"(?i)<h[1-6][^>]*>\s*PART\s*III\s*</h[1-6]>",
-                r"(?i)<h[1-6][^>]*>\s*Item\s*10\.?\s*Directors",
-                r"(?i)PART\s*III",
-            ];
-            
-            let mut end_pos = None;
-            for pattern in &end_patterns {
-                if let Ok(re) = Regex::new(pattern) {
-                    if let Some(mat) = re.find(&html_content[search_offset..]) {
-                        end_pos = Some(search_offset + mat.start());
-                        tracing::debug!("Found end pattern match at position: {}", end_pos.unwrap());
-                        break;
-                    }
-                }
-            }
-            
-            // If no end marker was found, use a fallback that goes to the end of the document.
-            let end_pos = end_pos.unwrap_or_else(|| (start + 300000).min(html_content.len()));
-            let min_section_size = get_min_section_size();
-            if end_pos > start && end_pos - start > min_section_size {
-                return Some((start, end_pos));
-            }
-        }
-        
-        None
-    }
-}
+            let preview_content = &html_content[lookahead_start..lookahead_end];
 
-/// Financial Statement extraction strategy
-/// This looks for common financial statement headings that would be in Item 8
-pub struct FinancialStatementExtractionStrategy;
+            // Check if the preview content looks like actual financial data start
+            if contains_financial_content(preview_content) {
+                // ** Found a valid candidate **
+                 tracing::info!(
+                     "Found validated Item 8 start candidate at {} with pattern: '{}'",
+                     potential_start_pos,
+                     start_re.as_str()
+                 );
+                 // Store the *first* valid start found and break loops
+                 first_valid_start = Some((potential_start_pos, start_re.as_str()));
+                 break 'outer_start; // Found the first valid start, no need to check weaker patterns
 
-impl ExtractionStrategy for FinancialStatementExtractionStrategy {
-    fn name(&self) -> &'static str {
-        "Financial Statement Strategy"
-    }
-    
-    fn extract(&self, html_content: &str) -> Option<(usize, usize)> {
-        // Patterns for common financial statement headings
-        let statement_patterns = [
-            r"(?i)<h[1-6][^>]*>\s*consolidated\s+financial\s+statements\s*</h[1-6]>",
-            r"(?i)<h[1-6][^>]*>\s*consolidated\s+statements\s+of\s+operations\s*</h[1-6]>",
-            r"(?i)<h[1-6][^>]*>\s*consolidated\s+statements\s+of\s+income\s*</h[1-6]>",
-            r"(?i)<h[1-6][^>]*>\s*consolidated\s+balance\s+sheets?\s*</h[1-6]>",
-            r"(?i)<h[1-6][^>]*>\s*consolidated\s+statements\s+of\s+cash\s+flows?\s*</h[1-6]>",
-        ];
-        
-        let mut best_match: Option<regex::Match> = None;
-        for pattern in &statement_patterns {
-            if let Ok(re) = Regex::new(pattern) {
-                if let Some(mat) = re.find(html_content) {
-                    // Skip if this is in a table of contents
-                    if is_in_table_of_contents(html_content, mat.start()) {
-                        continue;
-                    }
-                    
-                    best_match = match best_match {
-                        Some(current) => {
-                            if mat.start() < current.start() {
-                                Some(mat)
-                            } else {
-                                Some(current)
-                            }
-                        },
-                        None => Some(mat),
-                    };
-                }
+            } else {
+                tracing::debug!(
+                    "Skipping potential Item 8 start at {} (pattern: '{}') - no financial content found in preview.",
+                    potential_start_pos,
+                    start_re.as_str()
+                );
+                 // Continue searching for other potential start matches with this pattern or next patterns
             }
-        }
-        
-        let start_pos = best_match.map(|m| m.start())?;
-        
-        // Look for the end marker (either Part III or a fallback based on a chunk size)
-        let end_patterns = [
-            r"(?i)<h[1-6][^>]*>\s*PART\s*III\s*</h[1-6]>",
-            r"(?i)<h[1-6][^>]*>\s*Item\s*9[\.\s]*"
-        ];
-        
-        let mut end_pos = None;
-        for pattern in &end_patterns {
-            if let Ok(re) = Regex::new(pattern) {
-                if let Some(mat) = re.find(&html_content[start_pos..]) {
-                    let pos = start_pos + mat.start();
-                    let min_section_size = get_min_section_size();
-                    if pos > start_pos + min_section_size {
-                        end_pos = Some(pos);
-                        break;
-                    }
-                }
-            }
-        }
-        
-        let end_pos = end_pos.unwrap_or_else(|| (start_pos + 200000).min(html_content.len()));
-        
-        Some((start_pos, end_pos))
-    }
-}
+        } // End loop through matches for one pattern
+    } // End loop through start patterns
 
-/// Part II-based extraction strategy
-/// Looks for Item 8 after the PART II heading
-pub struct PartIIExtractionStrategy;
-
-impl ExtractionStrategy for PartIIExtractionStrategy {
-    fn name(&self) -> &'static str {
-        "Part II Strategy"
-    }
-    
-    fn extract(&self, html_content: &str) -> Option<(usize, usize)> {
-        // Find the PART II heading
-        let part2_re = Regex::new(r"(?i)<h[1-6][^>]*>\s*PART\s*II\s*</h[1-6]>").ok()?;
-        let part2_mat = part2_re.find(html_content)?;
-        let part2_pos = part2_mat.start();
-        
-        // Look for Item 8 after PART II
-        let item8_re = Regex::new(r"(?i)item\s*8\.?").ok()?;
-        let search_from = part2_pos;
-        let item8_matches: Vec<_> = item8_re.find_iter(&html_content[search_from..]).collect();
-        
-        if item8_matches.is_empty() {
+    // --- If no valid start was found, return None ---
+    let (start_pos, start_pattern_str) = match first_valid_start {
+        Some((pos, pattern)) => (pos, pattern),
+        None => {
+            tracing::warn!("No validated Item 8 start marker found after checking all patterns.");
             return None;
         }
-        
-        // Find the first Item 8 reference that isn't in the ToC
-        for item8_mat in item8_matches {
-            let start_pos = search_from + item8_mat.start();
-            
-            // Skip if this is in a table of contents
-            if is_in_table_of_contents(html_content, start_pos) {
-                continue;
-            }
-            
-            // Look ahead for financial content indicators
-            let look_ahead = 5000;
-            let end_preview = (start_pos + item8_mat.len() + look_ahead).min(html_content.len());
-            let preview = &html_content[start_pos + item8_mat.len()..end_preview];
-            
-            // Check for financial statement indicators
-            if preview.to_lowercase().contains("financial statements") || 
-               preview.to_lowercase().contains("balance sheet") ||
-               preview.to_lowercase().contains("statement of") ||
-               preview.to_lowercase().contains("cash flow") ||
-               preview.to_lowercase().contains("report of independent") ||
-               (preview.to_lowercase().contains("opinion") && preview.to_lowercase().contains("audit")) {
-                
-                // Look for Item 9 or PART III to determine the end
-                let end_patterns = [
-                    r"(?i)<h[1-6][^>]*>\s*Item\s*9\.?\s*",
-                    r"(?i)Item\s*9[\.\s]*\(?changes",
-                    r"(?i)<h[1-6][^>]*>\s*PART\s*III\s*</h[1-6]>"
-                ];
-                
-                let mut end_pos = None;
-                let search_from_end = (start_pos + 1000).min(html_content.len()); // Clamp to length
-                for pattern in &end_patterns {
-                    if let Ok(re) = Regex::new(pattern) {
-                        if let Some(mat) = re.find(&html_content[search_from_end..]) {
-                            end_pos = Some(search_from_end + mat.start());
-                            break;
-                        }
-                    }
-                }
+    };
+    tracing::info!("Selected Item 8 start position: {} (using pattern: '{}')", start_pos, start_pattern_str);
 
-                // If no end marker found, use a reasonable chunk size
-                let end_pos = end_pos.unwrap_or_else(|| (start_pos + 300000).min(html_content.len()));
-                
-                // Only return a result if the section is reasonably sized
-                let min_section_size = get_min_section_size();
-                if end_pos > start_pos && end_pos - start_pos > min_section_size {
-                    return Some((start_pos, end_pos));
+
+    // --- Find the END position ---
+    // Search for the end marker starting slightly after the validated start position
+    let search_for_end_from = (start_pos + END_SEARCH_BUFFER).min(html_content.len());
+    let mut end_pos: Option<usize> = None;
+    let mut end_marker_pattern_str: Option<&str> = None;
+
+    // Search only in the relevant part of the document
+    if search_for_end_from < html_content.len() {
+        let search_area = &html_content[search_for_end_from..];
+        for end_re in ITEM_8_END_RE.iter() {
+            if let Some(end_mat) = end_re.find(search_area) {
+                let potential_end_pos_relative = end_mat.start();
+                let potential_end_pos_absolute = search_for_end_from + potential_end_pos_relative;
+
+                tracing::trace!(
+                    "Found potential end marker at abs {} (rel {}) with pattern: '{}'",
+                    potential_end_pos_absolute, potential_end_pos_relative, end_re.as_str()
+                );
+                // We want the *earliest* end marker found after the start buffer
+                if end_pos.map_or(true, |current| potential_end_pos_absolute < current) {
+                    end_pos = Some(potential_end_pos_absolute);
+                    end_marker_pattern_str = Some(end_re.as_str());
+                    tracing::trace!("Updating earliest end marker to {} with pattern: '{}'", potential_end_pos_absolute, end_re.as_str());
                 }
             }
         }
-        
-        None
     }
+
+    let final_end_pos = end_pos.unwrap_or_else(|| {
+        // If no end marker found, use a fallback chunk size or end of document
+        let fallback_end = (start_pos + FALLBACK_END_CHUNK_SIZE).min(html_content.len());
+        tracing::warn!(
+            "Item 8 end marker not found after pos {}. Using fallback end: {}",
+            start_pos, fallback_end
+        );
+        fallback_end
+    });
+
+    if let Some(pattern_str) = end_marker_pattern_str {
+         tracing::info!("Selected earliest end marker at pos {} using pattern: {}", final_end_pos, pattern_str);
+    }
+
+    // Final validation of bounds
+    if final_end_pos <= start_pos {
+         tracing::error!("Item 8 end position ({}) is not after start position ({}). Cannot extract.", final_end_pos, start_pos);
+         return None; // Invalid bounds
+    }
+
+    tracing::info!("Returning final bounds: Start={}, End={}", start_pos, final_end_pos);
+    Some((start_pos, final_end_pos))
 }
 
-/// Section Extractor that uses multiple strategies to find the desired section
-pub struct SectionExtractor {
-    strategies: Vec<Box<dyn ExtractionStrategy>>,
-}
+
+/// Main extractor structure
+pub struct SectionExtractor;
 
 impl SectionExtractor {
-    /// Creates a new SectionExtractor with default extraction strategies
-    pub fn new() -> Self {
-        // Define standard patterns for Item 8 section extraction
-        let standard_strategy = PatternExtractionStrategy {
-            name: "Standard Item 8 Strategy",
-            start_patterns: vec![
-                r"(?i)<h[1-6][^>]*>\s*Item\s*8\.?\s*Financial\s*Statements\s*and\s*Supplementary\s*Data\s*</h[1-6]>",
-                r"(?i)Item\s*8\.?\s*Financial\s*Statements\s*and\s*Supplementary\s*Data",
-                r"(?i)<a[^>]*>\s*Item\s*8\.\s*</a>\s*Financial\s*Statements\s*and\s*Supplementary\s*Data",
-                r"(?i)Item\s*8[\.\s\-–—:]+\s*Financial\s*Statements\s*and\s*Supplementary\s*Data",
-                r"(?i)item\s*8[\.\s]*\(?financial\s+statements\s+and\s+supplementary\s+data\)?",
-                r"(?i)item\s*8[\.\s]*"
-            ],
-            end_patterns: vec![
-                r"(?i)<h[1-6][^>]*>\s*Item\s*9\.?\s*Changes\s*in\s*and\s*Disagreements\s*with\s*Accountants\s*</h[1-6]>",
-                r"(?i)Item\s*9\.?\s*Changes\s*in\s*and\s*Disagreements\s*with\s*Accountants",
-                r"(?i)<a[^>]*>\s*Item\s*9\.\s*</a>\s*Changes\s*in\s*and\s*Disagreements\s*with\s*Accountants",
-                r"(?i)Item\s*9[\.\s\-–—:]+\s*Changes\s*in\s*and\s*Disagreements\s*with\s*Accountants",
-                r"(?i)item\s*9[\.\s]*",
-                r"(?i)item\s*9[\.\s]*\(?changes",
-                r"(?i)<h[1-6][^>]*>\s*PART\s*III\s*</h[1-6]>"
-            ]
-        };
-        
-        // Create a vector of strategies to try in order
-        let strategies: Vec<Box<dyn ExtractionStrategy>> = vec![
-            Box::new(TocExtractionStrategy), // Our new ToC-guided strategy first
-            Box::new(ActualItem8ExtractionStrategy), // Then the strategy to find actual Item 8 content
-            Box::new(standard_strategy),
-            Box::new(TocExtractionStrategy),
-            Box::new(PartIIExtractionStrategy),
-            Box::new(FinancialStatementExtractionStrategy),
-        ];
-        
-        Self { strategies }
-    }
-    
-    /// Extracts Item 8 content using multiple strategies
+    pub fn new() -> Self { Self {} }
+
+    /// Extracts Item 8 content using the primary refined strategy.
     pub fn extract_item_8(
         &self,
-        html_content: &str, 
-        filing_year: u32, 
-        company_name: &str, 
-        ticker: &str
+        html_content: &str,
+        filing_year: u32,
+        company_name: &str,
+        ticker: &str,
+        min_section_size: usize,
     ) -> Result<ExtractedSection, ExtractError> {
-        // Keep track of extraction attempts for debugging
-        let mut debug_info = HashMap::new();
-        let min_section_size = get_min_section_size();
+        tracing::info!("Attempting to extract Item 8 for ticker {} ({}) with min size {}", ticker, filing_year, min_section_size);
 
-        // Try each strategy in turn
-        for strategy in &self.strategies {
-            let strategy_name = strategy.name();
-            tracing::debug!("Trying extraction strategy: {}", strategy_name);
-            
-            if let Some((start_pos, end_pos)) = strategy.extract(html_content) {
-                // Validate that we have a reasonable section size
-                if end_pos <= start_pos || end_pos - start_pos < min_section_size {
-                    debug_info.insert(
-                        strategy_name.to_string(), 
-                        format!("Section too small: {} bytes", end_pos - start_pos)
-                    );
-                    continue;
+        match find_item_8_bounds(html_content) {
+            Some((start_pos, end_pos)) => {
+                // Ensure end_pos doesn't exceed content length (should be handled by find_item_8_bounds, but double-check)
+                 let final_end_pos = end_pos.min(html_content.len());
+
+                if start_pos >= final_end_pos {
+                     tracing::error!("Invalid bounds after adjustment: Start={}, End={}", start_pos, final_end_pos);
+                     return Err(ExtractError::SectionNotFound("Invalid section bounds calculated".to_string()));
+                 }
+
+                let content_slice = &html_content[start_pos..final_end_pos];
+                let section_size = final_end_pos - start_pos;
+
+                // Check minimum size requirement
+                if section_size < min_section_size {
+                     tracing::error!("Extracted Item 8 section is too small ({} bytes, required {}) for ticker {} ({}). Start: {}, End: {}", section_size, min_section_size, ticker, filing_year, start_pos, final_end_pos);
+                     return Err(ExtractError::SectionNotFound(format!("Item 8 found but size {} bytes is less than minimum {} bytes", section_size, min_section_size)));
                 }
-                
-                // Extract the content between the markers
-                let content = html_content[start_pos..end_pos].to_string();
-                
-                // Validate we have actual financial content, not just a reference
-                let content_lower = content.to_lowercase();
-                let has_financial_terms = 
-                    content_lower.contains("consolidated balance sheet") ||
-                    content_lower.contains("statement of operations") ||
-                    content_lower.contains("statement of income") ||
-                    content_lower.contains("statement of cash flow") ||
-                    content_lower.contains("notes to consolidated") ||
-                    (content_lower.contains("report") && 
-                     content_lower.contains("independent") && 
-                     content_lower.contains("audit"));
-                    
-                let has_financial_tables = 
-                    content.contains("<table") && 
-                    (content_lower.contains("assets") || 
-                     content_lower.contains("liabilities") ||
-                     content_lower.contains("equity") ||
-                     content_lower.contains("revenue") ||
-                     content_lower.contains("expense"));
-                    
-                if !has_financial_terms && !has_financial_tables {
-                    tracing::warn!(
-                        "Strategy '{}' found Item 8 section but it may not contain financial statements!",
-                        strategy_name
-                    );
-                    debug_info.insert(
-                        strategy_name.to_string(), 
-                        "Found section lacks financial content indicators".to_string()
-                    );
-                    continue; // Try next strategy instead
+
+                // Final content validation on the *entire* extracted slice as a safety net
+                // Although preview was checked, ensure the full slice still looks right.
+                if !contains_financial_content(content_slice) {
+                    tracing::warn!("Extracted Item 8 section ({} bytes) for ticker {} ({}) lacks strong financial content indicators after final bounding. Start: {}, End: {}. Discarding.", section_size, ticker, filing_year, start_pos, final_end_pos);
+                     // Decide whether to error or return with warning. Error is safer.
+                     return Err(ExtractError::SectionNotFound("Item 8 section found but failed final content validation".to_string()));
                 }
-                
-                tracing::info!(
-                    "Successfully extracted Item 8 content using strategy '{}': {} bytes, start: {}, end: {}",
-                    strategy_name, content.len(), start_pos, end_pos
-                );
-                
-                return Ok(ExtractedSection {
+
+                tracing::info!("Successfully extracted Item 8 for ticker {} ({}): {} bytes, Start: {}, End: {}", ticker, filing_year, section_size, start_pos, final_end_pos);
+                Ok(ExtractedSection {
                     section_name: "Item 8".to_string(),
-                    section_title: "Financial Statements and Supplementary Data".to_string(),
-                    content,
+                    section_title: "Financial Statements and Supplementary Data".to_string(), // Could try to extract actual title later
+                    content: content_slice.to_string(),
                     filing_year,
                     company_name: company_name.to_string(),
                     ticker: ticker.to_string(),
-                });
-            } else {
-                debug_info.insert(strategy_name.to_string(), "No match found".to_string());
+                })
+            }
+            None => {
+                tracing::error!("Failed to find valid Item 8 boundaries for ticker {} ({})", ticker, filing_year);
+                // Make error message slightly more informative
+                Err(ExtractError::SectionNotFound(format!("No validated Item 8 start marker found for {}-{}", ticker, filing_year)))
             }
         }
-        
-        // If we get here, all strategies failed
-        let mut failure_info = String::new();
-        for (strategy, reason) in debug_info.iter() {
-            failure_info.push_str(&format!("{}: {}\n", strategy, reason));
-        }
-        
-        tracing::debug!("Item 8 extraction failed. Strategy results:\n{}", failure_info);
-        Err(ExtractError::SectionNotFound("Item 8".to_string()))
     }
 }
+
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    // Use a smaller min size for tests unless specifically testing size limits
+    const TEST_MIN_SIZE: usize = 50;
 
-    fn setup_test_env() {
-        // Set minimum section size to 50 for tests
-        env::set_var("MIN_SECTION_SIZE", "50");
-    }
-    
-    fn create_test_html(item8_content: &str, item9_content: &str) -> String {
-        format!(r#"
-        <!DOCTYPE html>
-        <html>
-        <head><title>Test 10-K Filing</title></head>
-        <body>
-            <h1>PART I</h1>
-            <h2>Item 1. Business</h2>
-            <p>Business description goes here...</p>
-            
-            <h1>PART II</h1>
-            <h2>{}</h2>
-            <p>Financial statements content...</p>
-            {}
-            
-            <h2>{}</h2>
-            <p>Changes in accountants content...</p>
-            
-            <h1>PART III</h1>
-            <h2>Item 10. Directors and Executive Officers</h2>
-            <p>Directors information...</p>
-        </body>
-        </html>
-        "#, item8_content, "Financial tables go here...", item9_content)
-    }
-    
-    fn create_test_html_with_toc(item8_content: &str, item9_content: &str) -> String {
-        format!(r##"
-    <!DOCTYPE html>
-    <html>
-    <head><title>Test 10-K Filing</title></head>
-    <body>
-        <h1>Table of Contents</h1>
-        <div class="toc">
-            <a href="#item1">Item 1. Business</a><br>
-            <a href="#item8">Item 8. Financial Statements and Supplementary Data</a><br>
-            <a href="#item9">Item 9. Changes in and Disagreements with Accountants</a><br>
-        </div>
-        
-        <h1>PART I</h1>
-        <h2 id="item1">Item 1. Business</h2>
-        <p>Business description goes here...</p>
-        
-        <h1>PART II</h1>
-        <h2 id="item8">{}</h2>
-        <p>Financial statements content...</p>
-        <h3>Consolidated Balance Sheets</h3>
-        <table>
-            <tr><th>Assets</th><th>2023</th><th>2022</th></tr>
-            <tr><td>Cash</td><td>1000</td><td>800</td></tr>
-        </table>
-        
-        <h2 id="item9">{}</h2>
-        <p>Changes in accountants content...</p>
-        
-        <h1>PART III</h1>
-        <h2>Item 10. Directors and Executive Officers</h2>
-        <p>Directors information...</p>
-    </body>
-    </html>
-    "##, item8_content, item9_content)
-    }    
-    
+    // Helper to create basic HTML structure for testing boundary detection
+     fn create_test_html(item8_header: &str, item8_body: &str, item9_header: &str) -> String {
+         format!(r#"
+         <!DOCTYPE html>
+         <html>
+         <head><title>Test 10-K Filing</title></head>
+         <body>
+             <h1>PART I</h1>
+             <h2>Item 1. Business</h2>
+             <p>Business description goes here...</p>
+             <p>Some filler text to increase distance.</p>
+             <p>More filler text.</p>
+
+             <h1>PART II</h1>
+             {} {} {} <p>Changes in accountants content...</p>
+             <p>Some other content.</p>
+
+             <h1>PART III</h1>
+             <h2>Item 10. Directors and Executive Officers</h2>
+             <p>Directors information...</p>
+              <p style="page-break-before: always;"></p>
+              <p><b>SIGNATURES</b></p>
+              <p>Pursuant to the requirements...</p>
+              <h2>EXHIBIT INDEX</h2>
+         </body>
+         </html>
+         "#, item8_header, item8_body, item9_header)
+     }
+
+     // Helper to create HTML with a ToC structure
+     fn create_test_html_with_toc(item8_header_in_toc: &str, item8_header_in_body: &str, item8_body: &str, item9_header_in_body: &str) -> String {
+         format!(r##"
+ <!DOCTYPE html>
+ <html>
+ <head><title>Test 10-K Filing with ToC</title></head>
+ <body>
+     <p>Some introductory text before ToC.</p>
+     <p>Blah blah blah.</p>
+     <p>Blah blah blah.</p>
+     <p>Blah blah blah.</p>
+     <p>Blah blah blah.</p>
+     <p>Blah blah blah.</p>
+     <p>Blah blah blah.</p>
+     <p>Blah blah blah.</p>
+     <p>Blah blah blah.</p>
+     <p>Blah blah blah.</p>
+     <p>Blah blah blah.</p>
+     <p>Blah blah blah.</p>
+     <h1>Table of Contents</h1>
+     <div class="toc">
+         <p><a href="#item1">Item 1. Business</a>...........................1</p>
+         <p><a href="#item1a">Item 1A. Risk Factors</a>......................10</p>
+         <p><a href="#item7">Item 7. MD&A</a>.............................40</p>
+         <p><a href="#item8link">{}</a>..................50</p> <p><a href="#item9link">Item 9. Changes</a>.........................55</p>
+         <p><a href="#item10link">Item 10. Directors</a>......................60</p>
+     </div>
+     <hr style="page-break-before: always;"/> <p>Some text between ToC end and Part I.</p>
+     <h1>PART I</h1>
+     <h2 id="item1">Item 1. Business</h2>
+     <p>Business description goes here...</p>
+     <p>Lots of content for Part I...</p>
+     <p>...</p>
+     <p>...</p>
+
+     <h1>PART II</h1>
+     <p>Some text before Item 8 header.</p>
+     <h2 id="item8">{}</h2> {} <p>Some text before Item 9 header.</p>
+     <h2 id="item9">{}</h2> <p>Changes in accountants content...</p>
+
+     <h1>PART III</h1>
+     <h2>Item 10. Directors and Executive Officers</h2>
+     <p>Directors information...</p>
+ </body>
+ </html>
+ "##, item8_header_in_toc, item8_header_in_body, item8_body, item9_header_in_body)
+     }
+
+    // --- Test Cases ---
+
+    // Basic test with standard H2 tags
     #[test]
-    fn test_standard_strategy() {
-        setup_test_env();
+    fn test_find_item_8_bounds_simple_h2() {
+        // Mock financial content
+        let item8_body = r#"<h3>Consolidated Balance Sheets</h3><table><tr><td>Assets</td><td>100</td></tr></table><p>Notes to financial statements</p>"#;
         let html = create_test_html(
-            "Item 8. Financial Statements and Supplementary Data", 
-            "Item 9. Changes in and Disagreements with Accountants"
+            "<h2>Item 8. Financial Statements and Supplementary Data</h2>",
+            item8_body,
+            "<h2>Item 9. Changes in and Disagreements with Accountants</h2>"
         );
-        
-        let strategy = PatternExtractionStrategy {
-            name: "Test Strategy",
-            start_patterns: vec![r"(?i)Item\s*8\.?\s*Financial\s*Statements"],
-            end_patterns: vec![r"(?i)Item\s*9\.?\s*Changes"],
-        };
-        
-        let result = strategy.extract(&html);
-        assert!(result.is_some());
-        
-        let (start, end) = result.unwrap();
-        let extracted = &html[start..end];
-        assert!(extracted.contains("Item 8. Financial Statements"));
-        assert!(!extracted.contains("Item 9. Changes"));
-    }
-    
-    #[test]
-    fn test_part_ii_strategy() {
-        setup_test_env();
-        let html = create_test_html(
-            "Item 8. Financial Statements and Supplementary Data", 
-            "Item 9. Changes in and Disagreements with Accountants"
-        );
-        
-        let strategy = PartIIExtractionStrategy;
-        let result = strategy.extract(&html);
-        assert!(result.is_some());
-    }
-    
-    #[test]
-    fn test_financial_statement_strategy() {
-        setup_test_env();
-        let html = r#"
-        <!DOCTYPE html>
-        <html>
-        <body>
-            <h1>PART II</h1>
-            <h2>Consolidated Financial Statements</h2>
-            <h3>Consolidated Balance Sheets</h3>
-            <table>
-                <tr><th>Assets</th><th>2023</th><th>2022</th></tr>
-                <tr><td>Cash</td><td>1000</td><td>800</td></tr>
-            </table>
-            
-            <h3>Consolidated Statements of Operations</h3>
-            <table>
-                <tr><th>Revenue</th><th>2023</th><th>2022</th></tr>
-                <tr><td>Total</td><td>5000</td><td>4500</td></tr>
-            </table>
-            
-            <h2>Item 9. Changes in Accountants</h2>
-        </body>
-        </html>
-        "#;
-        
-        let strategy = FinancialStatementExtractionStrategy;
-        let result = strategy.extract(html);
-        assert!(result.is_some());
-        
-        let (start, end) = result.unwrap();
-        let extracted = &html[start..end];
-        assert!(extracted.contains("Consolidated Financial Statements"));
-        assert!(extracted.contains("Consolidated Statements of Operations"));
-        assert!(!extracted.contains("Item 9. Changes in Accountants"));
-    }
-    
-    #[test]
-    fn test_toc_strategy() {
-        setup_test_env();
-        let html = r##"
-        <!DOCTYPE html>
-        <html>
-        <body>
-            <div class="table-of-contents">
-                <a href="#item1">Item 1. Business</a>
-                <a href="#item8">Item 8. Financial Statements and Supplementary Data</a>
-                <a href="#item9">Item 9. Changes in Accountants</a>
-            </div>
-            
-            <h1 id="item1">Item 1. Business</h1>
-            <p>Business description goes here...</p>
-            
-            <h1 id="item8">Item 8. Financial Statements and Supplementary Data</h1>
-            <p>Financial statements content...</p>
-            <table>
-                <tr><th>Assets</th><th>2023</th><th>2022</th></tr>
-            </table>
-            
-            <h1 id="item9">Item 9. Changes in Accountants</h1>
-            <p>Changes in accountants content...</p>
-        </body>
-        </html>
-        "##;
-        
-        let strategy = TocExtractionStrategy;
-        let result = strategy.extract(html);
-        assert!(result.is_some());
-        
-        let (start, end) = result.unwrap();
-        let extracted = &html[start..end];
-        assert!(extracted.contains("Item 8. Financial Statements"));
-        assert!(!extracted.contains("Item 9. Changes"));
-    }
-    
-    #[test]
-    fn test_tocguided_strategy() {
-        setup_test_env();
-        let html = create_test_html_with_toc(
-            "Item 8. Financial Statements and Supplementary Data", 
-            "Item 9. Changes in and Disagreements with Accountants"
-        );
-        
-        let strategy = TocExtractionStrategy;
-        let result = strategy.extract(&html);
-        assert!(result.is_some());
-        
-        let (start, end) = result.unwrap();
-        let extracted = &html[start..end];
-        assert!(extracted.contains("Item 8. Financial Statements"));
-        assert!(extracted.contains("Consolidated Balance Sheets"));
-        assert!(!extracted.contains("Item 9. Changes"));
-    }
-    
-    #[test]
-    fn test_is_in_table_of_contents() {
-        let html = create_test_html_with_toc(
-            "Item 8. Financial Statements and Supplementary Data", 
-            "Item 9. Changes in and Disagreements with Accountants"
-        );
-        
-        // Find ToC position
-        let toc_pos = html.find("Table of Contents").unwrap();
-        assert!(is_in_table_of_contents(&html, toc_pos + 50)); // Should be in ToC
-        
-        // Find Item 8 position in the actual content
-        let item8_pos = html.find("id=\"item8\"").unwrap();
-        assert!(!is_in_table_of_contents(&html, item8_pos + 50)); // Should not be in ToC
-    }
-    
-    #[test]
-    fn test_section_extractor_integration() {
-        setup_test_env();
-        // Create a test HTML with multiple possible extraction patterns
-        let html = r##"
-        <!DOCTYPE html>
-        <html>
-        <body>
-            <div class="table-of-contents">
-                <a href="#item8">Item 8. Financial Statements</a>
-            </div>
-            
-            <h1>PART II</h1>
-            
-            <h2 id="item8">Item 8. Financial Statements and Supplementary Data</h2>
-            <p>This section contains financial information for the company.</p>
-            
-            <h3>Consolidated Statements of Operations</h3>
-            <table>
-                <tr><th>Revenue</th><th>2023</th><th>2022</th></tr>
-                <tr><td>Total</td><td>5000</td><td>4500</td></tr>
-            </table>
-            
-            <h2>Item 9. Changes in Accountants</h2>
-        </body>
-        </html>
-        "##;
-        
-        let extractor = SectionExtractor::new();
-        let result = extractor.extract_item_8(html, 2023, "Test Company", "TEST");
-        
-        assert!(result.is_ok());
-        let section = result.unwrap();
-        assert_eq!(section.section_name, "Item 8");
-        assert_eq!(section.filing_year, 2023);
-        assert_eq!(section.ticker, "TEST");
-        assert!(section.content.contains("financial information"));
-        assert!(section.content.contains("Consolidated Statements"));
-        assert!(!section.content.contains("Item 9. Changes"));
+        let result = find_item_8_bounds(&html);
+        assert!(result.is_some(), "Failed to find bounds for simple H2 case");
+        if let Some((start, end)) = result {
+            let extracted = &html[start..end];
+            assert!(extracted.starts_with("<h2>Item 8."), "Extracted content should start with H2 tag");
+            assert!(extracted.contains(item8_body), "Extracted content missing body");
+            assert!(extracted.contains("Notes to financial statements"), "Extracted content missing notes phrase");
+            assert!(!extracted.contains("Item 9."), "Extracted content should not contain Item 9 header");
+            assert!(!extracted.contains("PART III"), "Extracted content should not contain PART III");
+        }
     }
 
+    // Test with bold paragraph tags often used
     #[test]
-    fn test_multiple_strategy_fallback() {
-        setup_test_env();
-        // Create HTML without standard Item 8 heading but with financial statements
-        let html = r#"
-        <!DOCTYPE html>
-        <html>
-        <body>
-            <h1>PART II</h1>
-            <h2>Financial Information</h2>
-            <p>The following financial statements are presented.</p>
-            
-            <h3>Consolidated Balance Sheets</h3>
-            <table>
-                <tr><th>Assets</th><th>2023</th><th>2022</th></tr>
-            </table>
-            
-            <h3>Consolidated Statements of Income</h3>
-            <table>
-                <tr><th>Revenue</th><th>2023</th><th>2022</th></tr>
-            </table>
-            
-            <h2>Item 9. Changes in Accountants</h2>
-        </body>
-        </html>
-        "#;
-        
+    fn test_find_item_8_bounds_bold_paragraph() {
+         let item8_body = r#"<div>Consolidated Statement of Operations</div><div>Revenue: 500</div><p>notes to financial statements</p>"#;
+         let html = create_test_html(
+             "<p><b>Item 8. Financial Statements and Supplementary Data</b></p>",
+             item8_body,
+             "<p><b>Item 9. Changes in and Disagreements...</b></p>"
+         );
+         let result = find_item_8_bounds(&html);
+          assert!(result.is_some(), "Failed to find bounds for bold paragraph case");
+         if let Some((start, end)) = result {
+             let extracted = &html[start..end];
+             assert!(extracted.contains("<p><b>Item 8."), "Should contain bold Item 8 paragraph start");
+             assert!(extracted.contains(item8_body), "Extracted content missing body");
+             assert!(!extracted.contains("Item 9."), "Extracted content should not contain Item 9 marker");
+         }
+    }
+
+    // Test case where Item 9 marker is absent, should end before PART III or Signatures
+    #[test]
+    fn test_find_item_8_bounds_no_item9() {
+        let item8_body = r#"<h3>Consolidated Balance Sheets</h3><table><tr><td>Assets</td><td>100</td></tr></table><p>Report of Independent Registered Public Accounting Firm</p>"#; // Add audit report phrase
+        let html = create_test_html(
+            "<h2>Item 8. Financial Statements</h2>", // Slightly different header text
+             item8_body,
+            "" // No Item 9 header provided in template args
+        );
+
+        // Manually find where Item 10 / PART III / Signatures start in the *rendered* test HTML
+        let part3_marker = "<h1>PART III</h1>";
+        let item10_marker = "<h2>Item 10. Directors";
+        let sig_marker = "<b>SIGNATURES</b>";
+        let exhibit_marker = "<h2>EXHIBIT INDEX</h2>";
+
+        let part3_pos = html.find(part3_marker).unwrap_or(html.len());
+        let item10_pos = html.find(item10_marker).unwrap_or(html.len());
+        let sig_pos = html.find(sig_marker).unwrap_or(html.len());
+        let exhibit_pos = html.find(exhibit_marker).unwrap_or(html.len());
+
+        // Expected end is the earliest of these markers
+        let expected_end = [part3_pos, item10_pos, sig_pos, exhibit_pos].iter().min().copied().unwrap_or(html.len());
+
+        let result = find_item_8_bounds(&html);
+        assert!(result.is_some(), "Failed to find bounds when Item 9 is missing");
+
+        if let Some((start, end)) = result {
+            let extracted = &html[start..end];
+            assert!(extracted.starts_with("<h2>Item 8."), "Should start with H2 tag");
+            assert!(extracted.contains(item8_body), "Extracted content missing body");
+            assert!(extracted.contains("Accounting Firm"), "Should contain audit report phrase"); // Check validation keyword
+            assert!(!extracted.contains(item10_marker), "Extracted content contains Item 10 marker");
+            assert!(!extracted.contains(part3_marker), "Extracted content contains PART III marker");
+            assert!(!extracted.contains(sig_marker), "Extracted content contains SIGNATURES marker");
+            assert!(!extracted.contains(exhibit_marker), "Extracted content contains EXHIBIT INDEX marker");
+
+            // Check if the found end position is close to the expected end position
+             assert!(end >= expected_end.saturating_sub(10) && end <= expected_end.saturating_add(10),
+                     "End position {} is too far from the earliest expected end marker start {}", end, expected_end);
+        }
+    }
+
+    // Test to ensure the extractor skips the ToC entry and finds the real one
+    #[test]
+    fn test_find_item_8_bounds_toc_skip() {
+        let item8_body = r#"<h3>Consolidated Balance Sheets</h3><table><tr><td>Assets</td><td>100</td></tr></table><p>Notes to Consolidated Financial Statements</p>"#;
+        let html = create_test_html_with_toc(
+            "Item 8. Financial Statements", // Header as it appears in ToC
+            "Item 8. Financial Statements and Supplementary Data", // Header in main body
+            item8_body,
+            "Item 9. Changes in and Disagreements with Accountants" // Item 9 in main body
+        );
+
+        // Find the positions manually for assertion
+        let toc_item8_marker = r#"<a href="#item8link">Item 8. Financial Statements</a>"#;
+        let actual_item8_marker = r#"<h2 id="item8">Item 8. Financial Statements and Supplementary Data</h2>"#;
+
+        let toc_item8_pos = html.find(toc_item8_marker).expect("ToC Item 8 marker not found in test HTML");
+        let actual_header_pos = html.find(actual_item8_marker).expect("Actual Item 8 marker not found in test HTML");
+
+        println!("Debug Positions: ToC Item 8 at {}, Actual H2 at {}", toc_item8_pos, actual_header_pos); // Add print for debugging
+
+        let result = find_item_8_bounds(&html);
+        assert!(result.is_some(), "Should find the main content Item 8 bounds");
+
+        if let Some((start, end)) = result {
+            println!("Debug Found Bounds: Start at {}, End at {}", start, end); // Add print for debugging
+
+             // Assert that the found start position is at the actual header, NOT the ToC entry
+             // Allow a small buffer in case of slight variations in regex start match
+             assert!(start >= actual_header_pos.saturating_sub(5) && start <= actual_header_pos.saturating_add(5),
+                    "Start position {} should be at actual header {}, not ToC area starting near {}", start, actual_header_pos, toc_item8_pos);
+
+            let extracted = &html[start..end];
+            assert!(extracted.contains(item8_body), "Extracted content missing body");
+            assert!(extracted.contains("Notes to Consolidated"), "Extracted content missing validation phrase");
+            assert!(!extracted.contains("Item 10."), "Extracted content should not contain Item 10");
+             assert!(!extracted.contains(r#"<div class="toc">"#), "Extracted content should not contain ToC div"); // Ensure we didn't grab ToC
+        }
+    }
+
+    // Test the full extractor logic integration
+    #[test]
+    fn test_extractor_integration_basic() {
+        let item8_body = r#"<h3>Consolidated Balance Sheets</h3><table><tr><td>Assets</td><td>100</td></tr></table><p>Some notes here.</p><p>Consolidated Statement of Cash Flows</p>"#; // Add validation keyword
+        let html = create_test_html(
+            "<h2>Item 8. Financial Statements and Supplementary Data</h2>",
+             item8_body,
+            "<h2>Item 9. Changes in and Disagreements with Accountants</h2>"
+        );
         let extractor = SectionExtractor::new();
-        let result = extractor.extract_item_8(html, 2023, "Test Company", "TEST");
-        
-        // The extractor should fall back to the financial statement strategy
-        assert!(result.is_ok());
-        let section = result.unwrap();
-        assert!(section.content.contains("Consolidated Balance Sheets"));
-        assert!(section.content.contains("Consolidated Statements of Income"));
+        let result = extractor.extract_item_8(&html, 2023, "TestCo", "TST", TEST_MIN_SIZE);
+        assert!(result.is_ok(), "Extractor failed on basic case: {:?}", result.err());
+        if let Ok(section) = result {
+            assert!(section.content.contains("Consolidated Balance Sheets"));
+             assert!(section.content.len() > TEST_MIN_SIZE);
+             assert!(!section.content.contains("Item 9."));
+        }
     }
-    
+
+    // Test integration with minimum size constraint failing
     #[test]
-    fn test_actual_item8_strategy() {
-        setup_test_env();
-        let html = r##"
-    <!DOCTYPE html>
-    <html>
-    <body>
-        <h1>Table of Contents</h1>
-        <a href="#item1">Item 1. Business</a><br>
-        <a href="#item8">Item 8. Financial Statements</a><br>
-        
-        <h1>PART I</h1>
-        <h2 id="item1">Item 1. Business</h2>
-        
-        <h1>PART II</h1>
-        <h2 id="item8">Item 8. Financial Statements and Supplementary Data</h2>
-        <p>Our financial statements begin on the following page.</p>
-        
-        <h3>Report of Independent Registered Public Accounting Firm</h3>
-        <p>We have audited the consolidated financial statements...</p>
-        
-        <h3>Consolidated Balance Sheets</h3>
-        <table>
-            <tr><th>Assets</th><th>2023</th></tr>
-            <tr><td>Cash</td><td>1000</td></tr>
-        </table>
-        
-        <h2>Item 9. Changes in Accountants</h2>
-    </body>
-    </html>
-    "##;
-        
-        let strategy = ActualItem8ExtractionStrategy;
-        let result = strategy.extract(html);
-        assert!(result.is_some());
-        
-        let (start, end) = result.unwrap();
-        let extracted = &html[start..end];
-        assert!(extracted.contains("Item 8. Financial Statements"));
-        assert!(extracted.contains("Report of Independent"));
-        assert!(extracted.contains("Consolidated Balance Sheets"));
-        assert!(!extracted.contains("Item 9. Changes"));
+    fn test_extractor_integration_too_small() {
+        // Content has financial keywords but is very short
+        let item8_body = r#"<p>Consolidated Balance Sheet</p>Assets: 10."#;
+        let html = create_test_html(
+            "<h2>Item 8. Financial Statements</h2>",
+             item8_body,
+            "<h2>Item 9. Changes</h2>"
+        );
+        let extractor = SectionExtractor::new();
+        // Set min size much larger than the content
+        let result = extractor.extract_item_8(&html, 2023, "TestCo", "TST", 500);
+        assert!(result.is_err(), "Extractor should fail due to min size constraint");
+        match result.err().unwrap() {
+            ExtractError::SectionNotFound(msg) => {
+                assert!(msg.contains("less than minimum"), "Unexpected error message for size failure: {}", msg);
+            },
+            e => panic!("Expected SectionNotFound error due to size, got {:?}", e),
+        }
     }
+
+    // Test integration where the content lacks financial keywords for validation
+     #[test]
+     fn test_extractor_integration_no_financial_content() {
+         // Content is reasonably long but lacks keywords
+         let item8_body = r#"<p>See notes elsewhere.</p><p>This section provides details.</p><p>Filler text to make it longer than min size.</p><p>More filler.</p><p>Even more filler.</p>"#;
+         let html = create_test_html(
+             "<h2>Item 8. Financial Statements</h2>",
+              item8_body,
+             "<h2>Item 9. Changes</h2>"
+         );
+         let extractor = SectionExtractor::new();
+         let result = extractor.extract_item_8(&html, 2023, "TestCo", "TST", TEST_MIN_SIZE);
+          assert!(result.is_err(), "Extractor should fail due to lack of financial content in preview/final check");
+          match result.err().unwrap() {
+              ExtractError::SectionNotFound(msg) => {
+                  // Expect error related to validation failure or no valid start found
+                   assert!(msg.contains("No validated Item 8 start marker found") || msg.contains("failed final content validation"), "Unexpected error message for content validation failure: {}", msg);
+              },
+              e => panic!("Expected SectionNotFound error due to content validation, got {:?}", e),
+          }
+     }
+
+     // Test the is_in_table_of_contents helper directly
+     #[test]
+     fn test_is_in_table_of_contents_logic() {
+         // Simulate HTML segments
+          let toc_html_simple = r##"<body><h1>Table of Contents</h1><div class="toc"><p><a href="#i8">Item 8. FS</a>...50</p></div><hr/><p>Real content starts</p></body>"##;
+          let toc_html_nav = r##"<body><nav class="tableofcontents"><ul><li>Item 1</li><li>Item 8 Financials</li></ul></nav><p>Real content starts</p></body>"##;
+          let content_html = r##"<body>...<hr/><h2>PART II</h2><h2 id="item8">Item 8. FS</h2><p>Consolidated...</p></body>"##;
+         let early_content_html = r##"<body><p>Intro text.</p><h2>Item 8 Details</h2><p>Not financials.</p></body>"##; // Item 8 mentioned early, but not ToC/financials
+
+         // Find positions within the simulated segments
+         let toc_match_pos_simple = toc_html_simple.find("Item 8. FS").unwrap();
+         let after_toc_end_marker_pos = toc_html_simple.find("Real content starts").unwrap();
+
+         let toc_match_pos_nav = toc_html_nav.find("Item 8 Financials").unwrap();
+         let after_nav_end_pos = toc_html_nav.find("Real content starts").unwrap();
+
+         let content_match_pos = content_html.find("Item 8. FS").unwrap();
+         let early_match_pos = early_content_html.find("Item 8 Details").unwrap();
+
+
+         // Assertions
+         assert!(is_in_table_of_contents(toc_html_simple, toc_match_pos_simple), "Should detect pos within ToC div");
+         assert!(!is_in_table_of_contents(toc_html_simple, after_toc_end_marker_pos), "Should NOT detect pos after HR end marker as ToC");
+
+         assert!(is_in_table_of_contents(toc_html_nav, toc_match_pos_nav), "Should detect pos within ToC nav");
+         assert!(!is_in_table_of_contents(toc_html_nav, after_nav_end_pos), "Should NOT detect pos after nav end marker as ToC");
+
+         assert!(!is_in_table_of_contents(content_html, content_match_pos), "Should NOT detect pos in main content (after HR) as ToC");
+
+         // Test early position check - this should be caught by positional/early checks now
+          assert!(is_in_table_of_contents(early_content_html, early_match_pos), "Should likely detect very early position as ToC/intro even without explicit markers");
+     }
 }

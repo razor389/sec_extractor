@@ -1,4 +1,3 @@
-
 [package]
 name = "sec_extractor"
 version = "0.1.0"
@@ -15,6 +14,7 @@ serde = { version = "1.0", features = ["derive"] } # Serialization/deserializati
 serde_json = "1.0" # JSON support
 regex = "1.10" # Regular expressions for section extraction
 chrono = "0.4" # Date/time handling
+once_cell = "1" # <<< Added for lazy static Regex compilation
 
 [dev-dependencies]
 tokio-test = "0.4" # Testing utilities for async code
