@@ -62,6 +62,7 @@ fn is_in_table_of_contents(html_content: &str, position: usize) -> bool {
     false
 }
 
+#[allow(dead_code)]
 // Helper function to find the end of a section starting from a position
 fn find_section_end(html_content: &str, start_pos: usize) -> Option<(usize, usize)> {
     // Look for Item 9 or PART III to determine the end
