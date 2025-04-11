@@ -6,7 +6,7 @@ use tracing_subscriber::{fmt, EnvFilter};
 /// Defaults to "info" if `RUST_LOG` is not set.
 pub fn setup_logging() {
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info")); // Default to INFO level
+        .unwrap_or_else(|_| EnvFilter::new("debug")); // Default to INFO level
 
     fmt()
         .with_env_filter(filter)

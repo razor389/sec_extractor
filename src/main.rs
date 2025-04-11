@@ -37,6 +37,10 @@ struct Args {
     /// Debug mode - save annotated HTML files for debugging
     #[arg(short, long)]
     debug: bool,
+    
+    /// Set minimum section size in bytes (default: 1000)
+    #[arg(long, default_value = "1000")]
+    min_section_size: Option<usize>,
 }
 
 #[tokio::main]
@@ -44,17 +48,21 @@ async fn main() -> Result<(), AppError> {
     // 1. Setup Logging (reads RUST_LOG env var)
     utils::logging::setup_logging();
 
-    if std::env::var("MIN_SECTION_SIZE").is_err() {
-        std::env::set_var("MIN_SECTION_SIZE", "1000");
-        tracing::debug!("Setting MIN_SECTION_SIZE to 1000 for production use");
-    } else {
-        let size = std::env::var("MIN_SECTION_SIZE").unwrap_or_else(|_| "50".to_string());
-        tracing::debug!("Using configured MIN_SECTION_SIZE: {}", size);
-    }
-
     // 2. Parse CLI Arguments
     let args = Args::parse();
     tracing::info!("Starting processing for args: {:?}", args);
+    
+    // Set MIN_SECTION_SIZE environment variable from command-line args or default
+    if let Some(size) = args.min_section_size {
+        std::env::set_var("MIN_SECTION_SIZE", size.to_string());
+        tracing::debug!("Setting MIN_SECTION_SIZE to {} from command-line argument", size);
+    } else if std::env::var("MIN_SECTION_SIZE").is_err() {
+        std::env::set_var("MIN_SECTION_SIZE", "1000");
+        tracing::debug!("Setting MIN_SECTION_SIZE to 1000 (default)");
+    } else {
+        let size = std::env::var("MIN_SECTION_SIZE").unwrap_or_else(|_| "1000".to_string());
+        tracing::debug!("Using existing MIN_SECTION_SIZE: {}", size);
+    }
     
     // 3. Initialize storage
     let storage = StorageManager::new(&args.output_dir)?;
@@ -79,7 +87,14 @@ async fn main() -> Result<(), AppError> {
     
     tracing::info!("Found {} 10-K filings", filings.len());
     
+    if filings.is_empty() {
+        return Err(AppError::Config(format!("No 10-K filings found for ticker {} in the specified date range", args.ticker)));
+    }
+    
     // 7. Process each filing
+    let mut success_count = 0;
+    let mut failure_count = 0;
+    
     for filing in filings {
         tracing::info!("Processing filing for year: {:?} ({})", filing.year, filing.accession_number);
         
@@ -107,6 +122,7 @@ async fn main() -> Result<(), AppError> {
                         tracing::info!("Saved raw filing to: {}", raw_filing_path);
                         
                         // Create debug HTML with highlighted patterns
+                        // Create debug HTML with highlighted patterns
                         let debug_patterns = [
                             (r"(?i)<h[1-6][^>]*>\s*Item\s*8\.?\s*Financial\s*Statements\s*and\s*Supplementary\s*Data\s*</h[1-6]>", "item8"),
                             (r"(?i)item\s*8[\.\s]*\(?financial\s+statements\s+and\s+supplementary\s+data\)?", "item8"),
@@ -117,6 +133,10 @@ async fn main() -> Result<(), AppError> {
                             (r"(?i)item\s*9[\.\s]*\(?changes", "item9"),
                             (r"(?i)<h[1-6][^>]*>\s*PART\s*II\s*</h[1-6]>", "start"),
                             (r"(?i)<h[1-6][^>]*>\s*PART\s*III\s*</h[1-6]>", "end"),
+                            (r"(?i)table\s+of\s+contents", "toc"),
+                            // FIXED: Use alternate raw string delimiters to allow unescaped quotes.
+                            (r#"(?i)<div[^>]*class=['"]?(?:toc|tableOfContents|index)['"]?[^>]*>"#, "toc"),
+                            (r#"(?i)<a[^>]*href="[^"]*(?:item[_\-]?8|financial[_\-]statements)[^"]*"[^>]*>.*?item\s*8.*?</a>"#, "toclink"),
                         ];
                         let debug_html_path = format!("{}/filing_annotated.html", debug_dir);
                         if let Err(e) = utils::html_debug::create_debug_html(&content, &debug_html_path, &debug_patterns) {
@@ -126,10 +146,11 @@ async fn main() -> Result<(), AppError> {
                         }
                     }
                     
-                    // Try to extract Item 8 using our new extractor
+                    // Try to extract Item 8 using our extractor
                     match section_extractor.extract_item_8(&content, year, &filing.company_name, &filing.ticker) {
                         Ok(section) => {
                             tracing::info!("Successfully extracted Item 8 section ({} bytes)", section.content.len());
+                            success_count += 1;
                             
                             // Save the section content
                             match storage.save_section(&section) {
@@ -145,6 +166,21 @@ async fn main() -> Result<(), AppError> {
                         },
                         Err(e) => {
                             tracing::error!("Failed to extract Item 8 section: {}", e);
+                            failure_count += 1;
+                            
+                            if args.debug {
+                                // Save failure information for debugging
+                                let debug_dir = format!("{}/{}/{}/debug", 
+                                    args.output_dir, 
+                                    filing.ticker.to_uppercase(), 
+                                    year);
+                                let failure_info_path = format!("{}/extraction_failure.txt", debug_dir);
+                                let failure_info = format!("Failed to extract Item 8 for {} {}: {}\n", 
+                                    filing.ticker, year, e);
+                                if let Err(e) = std::fs::write(&failure_info_path, failure_info) {
+                                    tracing::error!("Failed to save failure info: {}", e);
+                                }
+                            }
                         }
                     }
                 } else {
@@ -153,10 +189,16 @@ async fn main() -> Result<(), AppError> {
             },
             Err(e) => {
                 tracing::error!("Failed to download filing document: {}", e);
+                failure_count += 1;
             }
         }
     }
 
-    tracing::info!("Processing finished.");
+    tracing::info!("Processing finished. Success: {}, Failures: {}", success_count, failure_count);
+    
+    if success_count == 0 && failure_count > 0 {
+        return Err(AppError::Processing(format!("Failed to extract any Item 8 sections from {} filings", failure_count)));
+    }
+    
     Ok(())
 }
