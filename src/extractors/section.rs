@@ -14,7 +14,8 @@ const FALLBACK_END_CHUNK_SIZE: usize = 350_000; // Might still need a fallback s
 // --- CSS Selectors (Lazy Static) ---
 // Selectors for potential section headers
 static POTENTIAL_HEADER_SELECTOR: Lazy<Selector> = Lazy::new(|| {
-    Selector::parse("h1, h2, h3, h4, h5, h6, p > b, p > strong, div > b, div > strong, font") // Added font as sometimes seen
+    // Added 'div', 'span', and 'a' to catch more heading/link structures
+    Selector::parse("h1, h2, h3, h4, h5, h6, p > b, p > strong, div > b, div > strong, font, div, span, a")
         .expect("Failed to compile POTENTIAL_HEADER_SELECTOR")
 });
 
@@ -35,13 +36,19 @@ static TOC_END_SIBLING_SELECTOR: Lazy<Selector> = Lazy::new(|| {
 // Adapt existing patterns for text matching *within* selected elements
 static ITEM_8_START_TEXT_RE: Lazy<Vec<Regex>> = Lazy::new(|| {
     [
-        // More specific first
-        r"(?i)^Item\s*8\.?\s*Financial\s*Statements\s*(?:and\s*Supplementary\s*Data)?$", // Exact match in header
-        r"(?i)\bItem\s*8[\.\s\-–—:]+Financial\s*Statements", // Starts with Item 8 + Title part
-        r"(?i)\bItem\s*8\.?", // Contains "Item 8." - Lower priority
+        // Pattern 1: Match "Item 8." plus the full title, anchored to start/end of cleaned text
+        // Allows optional period after 8, optional period/space at the very end.
+        r"(?i)^\s*Item\s*8\.?\s*Financial\s*Statements\s*(?:and\s*Supplementary\s*Data)?\.?\s*$",
+
+        // Pattern 2: Match "Item 8." followed by "Financial Statements" anywhere after word boundary
+        // This catches cases where extra text might follow the main title within the same element
+        r"(?i)\bItem\s*8[\.\s\-–—:]+Financial\s*Statements",
+
+        // Pattern 3: REMOVED / COMMENTED OUT - Too broad, caused false positive
+        // r"(?i)\bItem\s*8\.?",
     ]
     .iter()
-    .filter_map(|pat| Regex::new(pat).ok())
+    .filter_map(|pat| Regex::new(pat).ok()) // Use filter_map for cleaner error handling on regex creation
     .collect()
 });
 
@@ -152,7 +159,11 @@ impl DomExtractor {
         // Iterate through potential header elements defined by the selector
         for element in document.select(&POTENTIAL_HEADER_SELECTOR) {
             let element_text = element.text().collect::<String>();
-            let cleaned_text = element_text.trim().replace("\n", " ").replace("&nbsp;", " ");
+            let cleaned_text = element_text
+                .trim()
+                .replace("\n", " ")
+                .replace("&nbsp;", " ")
+                .replace("&#160;", " ");
 
             // Check if element text matches any start patterns
             if start_patterns.iter().any(|re| re.is_match(&cleaned_text)) {
@@ -236,23 +247,65 @@ impl DomExtractor {
 
     /// Checks if an element is likely within a Table of Contents using DOM structure.
     fn is_in_toc_dom(&self, element: ElementRef) -> bool {
-        // Check 1: Traverse ancestors looking for a known ToC container
-        for ancestor in element.ancestors().filter_map(ElementRef::wrap) {
-            if TOC_CONTAINER_SELECTOR.matches(&ancestor) {
-                tracing::trace!("Element {:?} is inside a ToC container ({:?})", element.value().name(), ancestor.value().name());
-                return true; // Found a parent matching ToC container selector
-            }
-            // Stop traversing if we hit major structural tags like <body> or <html> unnecessarily
-            if ancestor.value().name() == "body" { break; }
+        tracing::trace!("Checking ToC for element <{}> | Text: '{}'", element.value().name(), element.text().collect::<String>().trim()); // Added text to log
+    
+        // Check 1: Is the element itself an anchor tag with an href? (Strong ToC indicator)
+        if element.value().name() == "a" && element.value().attr("href").is_some() {
+             tracing::debug!("Element itself is <a> tag with href, likely ToC link.");
+             return true;
         }
-
-        // Check 2: Check if element is preceded by a "Table of Contents" heading nearby
-        // This is trickier with siblings/preceding nodes in scraper, maybe less reliable.
-        // Let's stick with ancestor check for now.
-
-        // Check 3: Extremely early in the document? (Less reliable with DOM, positional checks were better)
-        // We might skip this in the DOM approach unless absolutely necessary.
-
+    
+        // Check 2: Traverse ancestors looking for clues
+        let mut table_ancestor_found = false; // Flag to check context
+        for ancestor_node in element.ancestors() {
+            if let Some(ancestor) = ElementRef::wrap(ancestor_node) {
+                let ancestor_name = ancestor.value().name();
+                tracing::trace!(" Checking ancestor <{}>", ancestor_name);
+    
+                // Check standard ToC container selector (class/id contains 'toc')
+                if TOC_CONTAINER_SELECTOR.matches(&ancestor) {
+                    tracing::debug!(" Element has ancestor matching TOC_CONTAINER_SELECTOR ({}), confirmed ToC.", ancestor_name);
+                    return true;
+                }
+    
+                // Check if an ancestor is an anchor tag (element is *inside* a link)
+                if ancestor_name == "a" && ancestor.value().attr("href").is_some() {
+                     tracing::debug!("Element has an ancestor <a> tag with href, likely ToC link structure.");
+                     return true;
+                }
+    
+                // Check for table structure - set flag but don't return immediately
+                if ["td", "tr", "table"].contains(&ancestor_name) {
+                     table_ancestor_found = true;
+                     tracing::trace!(" Found table ancestor: {}", ancestor_name);
+                }
+    
+    
+                if ancestor_name == "body" {
+                    tracing::trace!(" Reached body, stopping ancestor check.");
+                    break;
+                }
+            }
+        }
+    
+        // Check 3: Contextual check - Element looks like a heading but is inside a table structure?
+        // This is less certain, but can help for ToCs not marked with class/id="toc"
+        // Only apply if it wasn't already confirmed by checks 1 or 2.
+        if table_ancestor_found {
+            // If it's inside a table structure AND looks like a simple "Item X." link text, it's likely ToC
+            let element_text = element.text().collect::<String>();
+            let cleaned_text = element_text.trim().replace("&nbsp;", " ").replace("&#160;", " "); // Basic clean
+             // Example heuristic: Check if it looks like just "Item <number>." - common in ToC links
+            let simple_item_regex = Regex::new(r"^\s*Item\s+\d+[A-Z]?\.?\s*$").unwrap();
+            if simple_item_regex.is_match(&cleaned_text) {
+                 tracing::debug!("Element has table ancestor AND matches simple 'Item X.' pattern, likely ToC.");
+                 return true;
+            }
+            tracing::trace!("Element has table ancestor, but text doesn't match simple ToC pattern.");
+        }
+    
+    
+        tracing::trace!("Element not definitively identified within a known ToC structure.");
         false // Default: Assume not in ToC if no checks match
     }
 

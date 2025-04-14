@@ -2,13 +2,13 @@
 
 ## Overview
 
-This project aims to automate the extraction and parsing of "Item 8. Financial Statements and Supplementary Data" from SEC 10-K filings for publicly traded companies.
+This project automates the extraction and parsing of "Item 8. Financial Statements and Supplementary Data" from SEC 10-K filings for publicly traded companies using a **DOM-centric parsing strategy**.
 
-Recognizing the challenges of inconsistent formatting and potentially malformed HTML in EDGAR filings, this project now employs a **DOM-centric parsing strategy**. Instead of relying purely on regular expressions over the raw HTML string, it uses the `scraper` library to parse the filing into a Document Object Model (DOM). This allows for more robust navigation and section identification based on HTML structure, combined with text pattern matching within specific elements.
+Recognizing the challenges of inconsistent formatting and potentially malformed HTML in EDGAR filings, this project uses the `scraper` library to parse the filing into a Document Object Model (DOM). This allows for more robust navigation and section identification based on HTML structure, combined with text pattern matching (`regex`) within specific elements to locate the target section accurately.
 
-The primary goal remains to fetch relevant filings, accurately identify and isolate the Item 8 section, and prepare its content for further analysis (potentially including future table extraction, XBRL parsing, and LLM processing).
+The primary goal is to fetch relevant filings, accurately identify and isolate the Item 8 section, and prepare its content for further analysis (potentially including future table extraction, XBRL parsing, and LLM processing).
 
-## Key Features (Current & Planned)
+## Key Features
 
 * **EDGAR Interaction:** Fetches company filing indexes and specific filing documents via the SEC EDGAR API, adhering to rate limits and user-agent requirements (`reqwest`).
 * **DOM-Based Item 8 Extraction:** Parses the filing HTML into a DOM using `scraper`. Locates potential Item 8 boundaries by finding relevant HTML elements (headings, paragraphs) using CSS selectors, validating their text content with `regex`, and performing DOM-based checks to exclude Table of Contents entries.
@@ -45,12 +45,12 @@ The primary goal remains to fetch relevant filings, accurately identify and isol
     ├── extractors/
     │   ├── mod.rs
     │   └── section.rs     # DOM-based section extraction (scraper, regex)
-    ├── main.rs          # Entry point and CLI handling (clap, tokio)
+    ├── main.rs            # Entry point and CLI handling (clap, tokio)
     ├── storage/
     │   └── mod.rs         # Saving extracted data to disk
     └── utils/
         ├── error.rs       # Custom error handling (thiserror)
-        ├── html_debug.rs  # (Needs rework) HTML debugging helpers
+        ├── html_debug.rs  # (Needs rework/removal) HTML debugging helpers (byte-offset based)
         ├── logging.rs     # Logging setup (tracing)
         └── mod.rs
 ```
@@ -74,15 +74,15 @@ cargo build
 The application uses `clap` for command-line argument parsing.
 
 ```bash
-# Example: Fetch and extract Item 8 for Apple's 2023 10-K
+# Example: Fetch and extract Item 8 for Apple's 2023 filing (reported year)
 # Set log level via environment variable (e.g., info, debug, trace)
 export RUST_LOG=info
 
-cargo run -- --ticker AAPL --year 2023
+cargo run -- --ticker AAPL --start-year 2024 --end-year 2024
 
-# Example with date range and debug flag (Note: debug HTML generation needs rework)
+# Example with date range and debug flag (saves raw HTML on success/failure)
 export RUST_LOG=debug
-cargo run -- --ticker MSFT --start-year 2022 --end-year 2023 --output ./financial_data --debug
+cargo run -- --ticker MSFT --start-year 2023 --end-year 2024 --output ./financial_data --debug
 
 # Other options:
 # --accession-number <acc_num> # (Currently not implemented)
@@ -106,24 +106,26 @@ cargo run -- --ticker MSFT --start-year 2022 --end-year 2023 --output ./financia
 * `tracing`, `tracing-subscriber`: Logging framework
 * `roxmltree`: (Added for future) XML parsing (XBRL)
 * `chrono`: Date/time handling
+* `once_cell`: Lazy static initialization
 
 ## Implementation To-Do / Next Steps
 
-* **Refine `find_section_boundaries` Logic:**
-  * Improve robustness in finding the *correct* end marker element after the start element.
+* **Debug & Refine `find_section_boundaries` Logic:**
+  * **Priority:** Investigate why boundaries are not found for some filings (like GOOGL 2024). This likely involves tweaking selectors (`POTENTIAL_HEADER_SELECTOR`), regex patterns (`ITEM_8_START_TEXT_RE`, `ITEM_8_END_TEXT_RE`), or the logic for searching siblings/descendants for the end marker.
+  * Improve robustness in finding the *correct* end marker element after the start element. The current sibling/descendant search might need adjustment.
   * Handle cases where specific end markers (like Item 9) are missing, falling back to other markers (Part III, Signatures) or document structure.
-  * Implement a fallback if *no* suitable end marker is found (e.g., extract up to a certain size limit or end of Part II).
+  * Implement a more robust fallback if *no* suitable end marker is found (e.g., extract up to a certain size limit or end of Part II/document). The current behavior results in `ExtractError::SectionNotFound`.
 * **Refine `extract_html_between` Function:**
-  * Ensure accurate HTML reconstruction for the extracted slice.
+  * Ensure accurate HTML reconstruction for the extracted slice, especially around edge cases.
   * Verify correct handling of different node types (text, elements, comments if needed).
 * **Improve `is_in_toc_dom` Check:**
-  * Make the ToC detection more robust; consider checking preceding sibling headings or using more sophisticated heuristics beyond just ancestor classes/IDs.
+  * Make the ToC detection more robust; consider checking preceding sibling headings or using more sophisticated heuristics beyond just ancestor classes/IDs containing "toc". Analyze ToC structures in failed filings.
 * **Add Comprehensive Tests:**
-  * Write detailed unit tests for `find_section_boundaries`, `is_in_toc_dom`, and `extract_html_between` covering various HTML structures and edge cases found in real filings.
-  * Adapt integration tests to validate the end-to-end DOM-based extraction.
-* **Rework/Remove Debug HTML Utility:** The current `utils/html_debug.rs` relies on byte offsets. It needs to be significantly reworked to highlight DOM elements based on `ElementRef` or selectors, or be removed if not deemed essential for the DOM approach.
+  * Write detailed unit tests for `find_section_boundaries`, `is_in_toc_dom`, and `extract_html_between` covering various HTML structures and edge cases found in real filings (including the GOOGL case once fixed).
+  * Adapt integration tests to validate the end-to-end DOM-based extraction against known good and bad filings.
+* **Rework/Remove Debug HTML Utility:** The current `utils/html_debug.rs` relies on byte offsets, which is incompatible with the DOM approach. It needs to be significantly reworked to highlight DOM elements based on `ElementRef` or selectors, or be removed. The current `--debug` flag *does* helpfully save the raw HTML, which is useful.
 * **Implement XBRL Parsing:** Add logic to identify iXBRL tags within the extracted Item 8 HTML (`content_html`), extract the relevant XML fragments, and parse them using `roxmltree` to get structured financial facts. (Potentially in `src/extractors/xbrl.rs`).
-* **Test with Real-World Filings:** Validate the extractor against a diverse set of 10-K filings from different companies and years.
+* **Test with Real-World Filings:** Continue validating the extractor against a diverse set of 10-K filings from different companies and years.
 
 ## Contributing
 
